@@ -65,6 +65,18 @@ pub fn load_function_tags_from_dir<S: std::hash::BuildHasher>(
     }
 }
 
+pub fn load_block_tags_from_dir<S: std::hash::BuildHasher>(
+    namespace: &str,
+    tags_dir: &Path,
+    block_tags: &mut HashMap<String, Vec<String>, S>,
+) {
+    for dir in [tags_dir.join("block"), tags_dir.join("blocks")] {
+        if dir.is_dir() {
+            load_tags_recursive(namespace, &dir, &dir, block_tags);
+        }
+    }
+}
+
 fn load_tags_recursive<S: std::hash::BuildHasher>(
     namespace: &str,
     base_dir: &Path,

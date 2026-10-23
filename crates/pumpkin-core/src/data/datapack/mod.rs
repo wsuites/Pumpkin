@@ -76,6 +76,7 @@ pub struct DatapackManager {
     loaded_packs: RwLock<Vec<LoadedDatapack>>,
     functions: RwLock<HashMap<String, Arc<[String]>>>,
     function_tags: RwLock<HashMap<String, Vec<String>>>,
+    block_tags: RwLock<HashMap<String, Vec<String>>>,
     test_instances: RwLock<TestInstanceRegistry>,
     context_int_providers: RwLock<ContextProviderRegistry>,
     context_float_providers: RwLock<ContextProviderRegistry>,
@@ -108,6 +109,7 @@ impl DatapackManager {
             loaded_packs: RwLock::new(Vec::new()),
             functions: RwLock::new(HashMap::new()),
             function_tags: RwLock::new(HashMap::new()),
+            block_tags: RwLock::new(HashMap::new()),
             test_instances: RwLock::new(HashMap::new()),
             context_int_providers: RwLock::new(HashMap::new()),
             context_float_providers: RwLock::new(HashMap::new()),
@@ -131,6 +133,7 @@ impl DatapackManager {
         let mut all_recipes: Vec<DynamicRecipe> = Vec::new();
         let mut all_functions: HashMap<String, Vec<String>> = HashMap::new();
         let mut all_function_tags: HashMap<String, Vec<String>> = HashMap::new();
+        let mut all_block_tags: HashMap<String, Vec<String>> = HashMap::new();
         let mut all_test_instances: TestInstanceRegistry = HashMap::new();
         let mut all_context_int_providers: ContextProviderRegistry = HashMap::new();
         let mut all_context_float_providers: ContextProviderRegistry = HashMap::new();
@@ -161,6 +164,7 @@ impl DatapackManager {
             recipes: &mut all_recipes,
             functions: &mut all_functions,
             function_tags: &mut all_function_tags,
+            block_tags: &mut all_block_tags,
             test_instances: &mut all_test_instances,
             damage_types: &mut all_damage_type_defs,
             context_int_providers: &mut all_context_int_providers,
@@ -179,14 +183,7 @@ impl DatapackManager {
 
         let damage_type_registry = build_damage_type_registry(all_damage_type_defs);
 
-        let mut all_advancements = HashMap::new();
-        for pack in &loaded_packs_vec {
-            advancement::load_advancements_from_pack(&pack.root_path, &mut all_advancements);
-        }
-        if !all_advancements.is_empty() {
-            info!("Loaded {} datapack advancement(s)", all_advancements.len());
-        }
-        self.advancements.set(all_advancements);
+        self.load_advancements(&loaded_packs_vec);
 
         recipe_manager.set_recipes(all_recipes);
         *self
@@ -202,6 +199,10 @@ impl DatapackManager {
             .function_tags
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = all_function_tags;
+        *self
+            .block_tags
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = all_block_tags;
         *self
             .test_instances
             .write()
@@ -724,6 +725,30 @@ impl DatapackManager {
         Err(format!(
             "Structure '{resource_location}' was not found in any enabled datapack or embedded resources"
         ))
+    }
+
+    fn load_advancements(&self, packs: &[LoadedDatapack]) {
+        let mut all_advancements = HashMap::new();
+        for pack in packs {
+            advancement::load_advancements_from_pack(&pack.root_path, &mut all_advancements);
+        }
+        if !all_advancements.is_empty() {
+            info!("Loaded {} datapack advancement(s)", all_advancements.len());
+        }
+        self.advancements.set(all_advancements);
+    }
+
+    /// Resolves a block tag to block ids, merging datapack entries with the built-in tag.
+    #[must_use]
+    pub fn resolve_block_tag(&self, tag: &str) -> Vec<u16> {
+        let tags = self
+            .block_tags
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ids = Vec::new();
+        let mut visited = Vec::new();
+        collect_block_tag(&tags, tag, &mut ids, &mut visited);
+        ids
     }
 
     pub fn get_function_names(&self) -> Vec<String> {
@@ -1365,10 +1390,52 @@ fn build_damage_type_registry(
     damage_type_registry
 }
 
+fn normalize_id(id: &str) -> String {
+    if id.contains(':') {
+        id.to_string()
+    } else {
+        format!("minecraft:{id}")
+    }
+}
+
+fn collect_block_tag(
+    tags: &HashMap<String, Vec<String>>,
+    tag: &str,
+    ids: &mut Vec<u16>,
+    visited: &mut Vec<String>,
+) {
+    let tag = normalize_id(tag);
+    if visited.contains(&tag) {
+        return;
+    }
+    if let Some(builtin) =
+        pumpkin_data::tag::get_tag_ids(pumpkin_data::tag::RegistryKey::Block, &tag).or_else(|| {
+            pumpkin_data::tag::get_tag_ids(
+                pumpkin_data::tag::RegistryKey::Block,
+                tag.strip_prefix("minecraft:").unwrap_or(&tag),
+            )
+        })
+    {
+        ids.extend_from_slice(builtin);
+    }
+    visited.push(tag.clone());
+    let Some(entries) = tags.get(&tag) else {
+        return;
+    };
+    for entry in entries {
+        if let Some(nested) = entry.strip_prefix('#') {
+            collect_block_tag(tags, nested, ids, visited);
+        } else if let Some(block) = pumpkin_data::Block::from_name(&normalize_id(entry)) {
+            ids.push(block.id.as_u16());
+        }
+    }
+}
+
 struct PackContentAccumulators<'a> {
     recipes: &'a mut Vec<DynamicRecipe>,
     functions: &'a mut HashMap<String, Vec<String>>,
     function_tags: &'a mut HashMap<String, Vec<String>>,
+    block_tags: &'a mut HashMap<String, Vec<String>>,
     test_instances: &'a mut TestInstanceRegistry,
     damage_types: &'a mut HashMap<String, DamageTypeDefinition>,
     context_int_providers: &'a mut ContextProviderRegistry,
@@ -1516,6 +1583,7 @@ fn load_pack_contents(
                     &tags_dir,
                     acc.function_tags,
                 );
+                function_loader::load_block_tags_from_dir(&namespace, &tags_dir, acc.block_tags);
             }
             // Load game test instances
             let test_instance_dir = ns_path.join("test_instance");
