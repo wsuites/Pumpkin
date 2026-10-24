@@ -29,6 +29,7 @@ use crate::command::errors::error_types::CommandErrorType;
 use crate::command::node::dispatcher::CommandDispatcher;
 use crate::command::node::{CommandExecutor, CommandExecutorResult};
 use crate::entity::EntityBase;
+use crate::entity::decoration::display::ItemDisplayEntity;
 use crate::world::World;
 
 const DESCRIPTION: &str = "Modifies items in block or entity inventories.";
@@ -214,6 +215,12 @@ pub fn read_entity_slot(target: &Arc<dyn EntityBase>, mojang_slot: usize) -> Opt
             _ => return None,
         };
         return (slot < inventory.size()).then(|| inventory.get_stack(slot));
+    }
+    // Vanilla `ItemDisplay.getSlot(0)` exposes the displayed item (`contents`/`container.0`).
+    if let Some(display) =
+        (target.as_ref() as &dyn std::any::Any).downcast_ref::<ItemDisplayEntity>()
+    {
+        return (mojang_slot == 0).then(|| display.get_item());
     }
     let living = target.get_living_entity()?;
     let eq = equipment_slot(mojang_slot)?;
@@ -530,6 +537,13 @@ pub fn write_entity_slot(
                     return true;
                 }
             }
+        }
+    } else if let Some(display) =
+        (target.as_ref() as &dyn std::any::Any).downcast_ref::<ItemDisplayEntity>()
+    {
+        if mojang_slot == 0 {
+            display.set_item(item_stack.clone());
+            return true;
         }
     } else if let Some(living) = target.get_living_entity() {
         let mapped_eq = if mojang_slot == 98 {
