@@ -1498,7 +1498,7 @@ impl Server {
         // Global tasks
         self.player_data_storage.tick(self);
 
-        // Scoreboard and command storage live outside chunks, so they follow the world autosave.
+        // Entities, the scoreboard and command storage follow the world autosave, like vanilla.
         if let Some(world) = worlds.first() {
             let autosave = world.level.autosave_ticks;
             let tick = u64::try_from(self.tick_count.load(Ordering::Relaxed)).unwrap_or(0);
@@ -1507,6 +1507,10 @@ impl Server {
                 && tick.is_multiple_of(autosave)
                 && world.level.save_enabled.load(Ordering::Relaxed)
             {
+                for world in worlds.iter() {
+                    let world = world.clone();
+                    self.spawn_task(async move { world.autosave_entities().await });
+                }
                 let server = self.clone();
                 self.spawn_task(async move {
                     let result =
