@@ -316,7 +316,14 @@ impl Scoreboard {
         target.send_editioned(&je_display, &be_display);
 
         if let Some(name) = objective_name {
+            let newly_tracked = !self.is_displayed(name);
             self.display_slots.insert(slot, name.to_string());
+            // Vanilla's `startTrackingObjective` sends the objective's current scores.
+            if newly_tracked && let Some(scores) = self.scores.get(name) {
+                for score in scores.values() {
+                    Self::send_score(target, score);
+                }
+            }
         } else {
             self.display_slots.remove(&slot);
         }
@@ -367,6 +374,28 @@ impl Scoreboard {
             return;
         }
 
+        // Like vanilla's `ServerScoreboard.onScoreChanged`, clients only hear about
+        // scores of objectives shown in a display slot. Datapacks churn hidden
+        // objectives thousands of times per tick.
+        if self.is_displayed(&score.objective_name) {
+            Self::send_score(target, &score);
+        }
+
+        self.scores
+            .entry(score.objective_name.clone())
+            .or_default()
+            .insert(score.entity_name.clone(), score);
+    }
+
+    /// Whether the objective is shown in any display slot (vanilla's tracked objectives).
+    #[must_use]
+    pub fn is_displayed(&self, objective_name: &str) -> bool {
+        self.display_slots
+            .values()
+            .any(|name| name == objective_name)
+    }
+
+    fn send_score(target: &impl ScoreboardTarget, score: &ScoreboardScore) {
         let je_packet = CUpdateScore::new(
             score.entity_name.clone(),
             score.objective_name.clone(),
@@ -388,11 +417,6 @@ impl Scoreboard {
         };
 
         target.send_editioned(&je_packet, &be_packet);
-
-        self.scores
-            .entry(score.objective_name.clone())
-            .or_default()
-            .insert(score.entity_name.clone(), score);
     }
 
     pub fn set_score_value(
@@ -437,6 +461,12 @@ impl Scoreboard {
         entity_name: &str,
         objective_name: &str,
     ) {
+        if !self.is_displayed(objective_name) {
+            if let Some(objective_scores) = self.scores.get_mut(objective_name) {
+                objective_scores.remove(entity_name);
+            }
+            return;
+        }
         let je_packet = CResetScore::new(entity_name.to_string(), Some(objective_name.to_string()));
 
         let be_packet = BSetScore {
@@ -679,7 +709,10 @@ impl Scoreboard {
             player.try_enqueue_packet_editioned(&je_display, &be_display);
         }
 
-        for objective_scores in self.scores.values() {
+        for (objective_name, objective_scores) in &self.scores {
+            if !self.is_displayed(objective_name) {
+                continue;
+            }
             for score in objective_scores.values() {
                 let je_packet = CUpdateScore::new(
                     score.entity_name.clone(),

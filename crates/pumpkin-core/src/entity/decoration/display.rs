@@ -3,9 +3,7 @@ use std::sync::{
     atomic::{AtomicI8, AtomicI32, AtomicU8, Ordering},
 };
 
-use pumpkin_data::{
-    Block, BlockStateId, damage::DamageType, item_stack::ItemStack,
-};
+use pumpkin_data::{Block, BlockStateId, damage::DamageType, item_stack::ItemStack};
 use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
 use pumpkin_protocol::{
     codec::{item_stack_seralizer::ItemStackSerializer, var_int::VarInt},

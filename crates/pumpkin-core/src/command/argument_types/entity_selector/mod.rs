@@ -263,6 +263,9 @@ impl EntitySelector {
         if let Some(distance_bounds) = self.distance {
             list.push(EntitySelectorPredicate::Distance(distance_bounds, pos));
         }
+        // Every check is side-effect free, so run the cheap ones first and
+        // reject most entities before the scoreboard lookups or NBT writes.
+        list.sort_by_key(EntitySelectorPredicate::cost);
 
         EntitySelectorPredicate::new_all_of(list)
     }
@@ -471,6 +474,19 @@ fn entity_actual_name(entity: &dyn EntityBase) -> String {
 }
 
 impl EntitySelectorPredicate {
+    /// Rough relative cost of [`Self::test`], used to order a selector's checks.
+    const fn cost(&self) -> u8 {
+        match self {
+            Self::EntityType(..) | Self::IsAlive | Self::GameMode(..) => 0,
+            Self::BoundingBox(_) | Self::Distance(..) | Self::Rotation(..) => 1,
+            Self::Tag(..) | Self::ExperienceLevel(_) => 2,
+            Self::Name(..) | Self::Team(..) | Self::Advancements(_) => 3,
+            Self::Scores(_) => 4,
+            Self::AllOf(_) | Self::Predicate(..) => 5,
+            Self::Nbt(..) => 6,
+        }
+    }
+
     #[must_use]
     pub const fn new_all_of(predicates: Vec<Self>) -> Self {
         Self::AllOf(predicates)
@@ -518,7 +534,10 @@ impl EntitySelectorPredicate {
                     .scoreboard_tags
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contains(expected_tag);
+                    // Entities carry a handful of tags, and datapack tags are long, so
+                    // comparing in place beats hashing the expected tag for every entity.
+                    .iter()
+                    .any(|tag| tag == expected_tag);
                 has_tag ^ invert
             }
             Self::Team(expected_team, invert) => {
@@ -534,7 +553,17 @@ impl EntitySelectorPredicate {
                 has_team ^ invert
             }
             Self::Scores(scores_map) => {
-                let actual_name = entity.get_scoreboard_name();
+                // Formats the holder name on the stack: this runs for every entity a
+                // datapack selector scans, so a heap string per entity adds up.
+                let mut uuid_buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+                let actual_name: &str = match entity.get_player() {
+                    Some(player) => &player.gameprofile.name,
+                    None => entity
+                        .get_entity()
+                        .entity_uuid
+                        .hyphenated()
+                        .encode_lower(&mut uuid_buf),
+                };
                 let world = entity.get_entity().world.load();
                 let scoreboard = world
                     .scoreboard
@@ -543,7 +572,7 @@ impl EntitySelectorPredicate {
                 // Vanilla fails the selector when the holder has no score in the objective.
                 scores_map.iter().all(|(objective, bounds)| {
                     scoreboard
-                        .get_score(&actual_name, objective)
+                        .get_score(actual_name, objective)
                         .is_some_and(|score| bounds.matches(score.value.0))
                 })
             }
