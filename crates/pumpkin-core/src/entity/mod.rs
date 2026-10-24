@@ -42,8 +42,8 @@ use pumpkin_protocol::{
     codec::var_int::VarInt,
     codec::var_ulong::VarULong,
     java::client::play::{
-        CEntityPositionSync, CEntityVelocity, CPlayerPosition, CSetEntityMetadata, CSetPassengers,
-        CSpawnEntity, Metadata, MetadataSerializer,
+        CEntityVelocity, CPlayerPosition, CSetEntityMetadata, CSetPassengers, CSpawnEntity,
+        Metadata, MetadataSerializer,
     },
 };
 use pumpkin_util::math::vector3::Axis;
@@ -3479,7 +3479,7 @@ impl Entity {
         position: Vector3<f64>,
         yaw: Option<f32>,
         pitch: Option<f32>,
-        world: &World,
+        _world: &World,
     ) {
         // Update server-side position and bounding box
         self.set_pos(position);
@@ -3489,33 +3489,52 @@ impl Entity {
         if let Some(pitch) = pitch {
             self.set_pitch(pitch);
         }
-        // Update cache so we don't send rubberbanding deltas
-        self.last_sent_pos.store(position);
         // Vanilla `teleportTo` carries the passengers along (`teleportPassengers`).
+        // Nothing is sent here: like vanilla, the tracker (`ServerEntity.sendChanges`) syncs
+        // the final position on its next update. Sending every teleport would leak
+        // intermediate positions, e.g. a datapack that teleports away and back in the same
+        // tick, which makes the client snap instead of interpolating.
         self.position_riders();
-        // TODO: use `pumpkin_util::math::pack_degrees`.
-        if let Some(yaw) = yaw {
-            self.last_sent_yaw
-                .store((yaw * 256.0 / 360.0).rem_euclid(256.0) as u8, Relaxed);
-            self.last_sent_head_yaw
-                .store((yaw * 256.0 / 360.0).rem_euclid(256.0) as u8, Relaxed);
+        // Vanilla `sendTeleportTransitionToPlayers`: players riding the entity always get the
+        // teleport, because the client drives its own vehicle and would otherwise move it
+        // back with its next `MoveVehicle` packet.
+        self.send_teleport_to_riders();
+    }
+
+    fn send_teleport_to_riders(&self) {
+        let mut riders = Vec::new();
+        self.collect_player_riders(&mut riders);
+        if riders.is_empty() {
+            return;
         }
-        if let Some(pitch) = pitch {
-            self.last_sent_pitch
-                .store((pitch * 256.0 / 360.0).rem_euclid(256.0) as u8, Relaxed);
-        }
-        let chunk_pos = self.chunk_pos.load();
-        world.broadcast_to_chunk(
-            chunk_pos,
-            &CEntityPositionSync::new(
-                self.entity_id.into(),
-                position,
-                self.velocity.load(),
-                yaw.unwrap_or(self.yaw.load()),
-                pitch.unwrap_or(self.pitch.load()),
-                self.on_ground.load(Ordering::SeqCst),
-            ),
+        let packet = pumpkin_protocol::java::client::play::CTeleportEntity::new(
+            self.entity_id.into(),
+            self.pos.load(),
+            Vector3::new(0.0, 0.0, 0.0),
+            self.yaw.load(),
+            self.pitch.load(),
+            &[],
+            self.on_ground.load(Ordering::SeqCst),
         );
+        for rider in riders {
+            if let Some(player) = rider.get_player() {
+                player.try_send_client_packet(&packet);
+            }
+        }
+    }
+
+    fn collect_player_riders(&self, out: &mut Vec<Arc<dyn EntityBase>>) {
+        let passengers = self
+            .passengers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for passenger in passengers {
+            passenger.get_entity().collect_player_riders(out);
+            if passenger.get_player().is_some() {
+                out.push(passenger);
+            }
+        }
     }
 
     pub fn get_eye_pos(&self) -> Vector3<f64> {
