@@ -94,6 +94,7 @@ pub mod projectile;
 pub mod projectile_deflection;
 pub mod spawn_util;
 pub mod synched_entity_data;
+pub mod tag_index;
 pub mod tnt;
 pub mod r#type;
 pub mod vehicle;
@@ -1153,6 +1154,18 @@ impl EntityBoundingBox {
     }
 }
 
+impl Drop for Entity {
+    fn drop(&mut self) {
+        let tags = self
+            .scoreboard_tags
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for tag in tags.iter() {
+            tag_index::remove(tag, self.entity_id);
+        }
+    }
+}
+
 impl Entity {
     pub fn new(
         world: Arc<World>,
@@ -1388,17 +1401,27 @@ impl Entity {
             .scoreboard_tags
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        tags.len() < MAX_SCOREBOARD_TAGS && tags.insert(tag.to_owned())
+        let added = tags.len() < MAX_SCOREBOARD_TAGS && tags.insert(tag.to_owned());
+        drop(tags);
+        if added {
+            tag_index::insert(tag, self.entity_id);
+        }
+        added
     }
 
     /// Removes a scoreboard tag from this entity.
     ///
     /// Returns `false` if the entity did not have the tag.
     pub fn remove_scoreboard_tag(&self, tag: &str) -> bool {
-        self.scoreboard_tags
+        let removed = self
+            .scoreboard_tags
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(tag)
+            .remove(tag);
+        if removed {
+            tag_index::remove(tag, self.entity_id);
+        }
+        removed
     }
 
     /// Sets a custom name for the entity, typically used with nametags
@@ -4469,13 +4492,18 @@ impl Entity {
                 .scoreboard_tags
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            tags.clear();
+            for tag in tags.drain() {
+                tag_index::remove(&tag, self.entity_id);
+            }
             tags.extend(
                 tag_list
                     .iter()
                     .filter_map(|tag| tag.extract_string().map(str::to_owned))
                     .take(MAX_SCOREBOARD_TAGS),
             );
+            for tag in tags.iter() {
+                tag_index::insert(tag, self.entity_id);
+            }
         }
 
         if let Some(custom_data) = nbt

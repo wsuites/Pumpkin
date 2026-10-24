@@ -852,12 +852,9 @@ impl ReturnValueCallable for StoreData {
         let value = stored_amount(result, self.store_result);
         // Vanilla swallows every syntax error raised while writing the stored value.
         let _ = (|| {
-            let mut root = NbtTag::Compound(self.accessor.get_data()?);
-            self.path
-                .set(&mut root, self.number_type.create_tag(value, self.scale))?;
-            if let NbtTag::Compound(data) = root {
-                self.accessor.set_data(&data)?;
-            }
+            let tag = self.number_type.create_tag(value, self.scale);
+            self.accessor
+                .modify(&mut |root| self.path.set(root, tag.clone()))?;
             Ok::<(), CommandSyntaxError>(())
         })();
         Ok(())
@@ -1292,8 +1289,9 @@ fn check_data_matches(
         let id = context.get_argument::<Identifier>("id")?;
         let server = context.server().clone();
         let accessor = StorageDataAccessor::new(id.to_string(), server);
-        let data = accessor.get_data()?;
-        path.count_matching(&NbtTag::Compound(data))
+        let mut count = 0;
+        accessor.read(&mut |root| count = path.count_matching(root))?;
+        count
     };
     // Mirrors vanilla `checkMatchingData`: a missing path counts as zero matches, not an error.
     Ok(count > 0)

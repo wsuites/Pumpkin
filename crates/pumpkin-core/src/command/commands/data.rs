@@ -211,6 +211,37 @@ pub trait DataAccessor: Send + Sync {
     fn get_modified_success(&self) -> TextComponent;
     fn get_print_success(&self, data: &NbtTag) -> TextComponent;
     fn get_print_scaled_success(&self, path: &NbtPath, scale: f64, value: i32) -> TextComponent;
+
+    /// Lends the data, as a compound tag, to `f`. Accessors that own their data
+    /// (command storage) lend it without copying.
+    fn read(&self, f: &mut dyn FnMut(&NbtTag)) -> Result<(), CommandSyntaxError> {
+        f(&NbtTag::Compound(self.get_data()?));
+        Ok(())
+    }
+
+    /// Runs `f` on the data, as a compound tag, and stores the result when `f`
+    /// succeeds. Command storage is edited in place, like vanilla's `CommandStorage`.
+    fn modify(
+        &self,
+        f: &mut dyn FnMut(&mut NbtTag) -> Result<i32, CommandSyntaxError>,
+    ) -> Result<i32, CommandSyntaxError> {
+        let mut root = NbtTag::Compound(self.get_data()?);
+        let result = f(&mut root)?;
+        if let NbtTag::Compound(data) = root {
+            self.set_data(&data)?;
+        }
+        Ok(result)
+    }
+}
+
+/// Reads the tags `path` selects from the accessor's data.
+pub fn read_path(
+    accessor: &dyn DataAccessor,
+    path: &NbtPath,
+) -> Result<Vec<NbtTag>, CommandSyntaxError> {
+    let mut result = Ok(Vec::new());
+    accessor.read(&mut |root| result = path.get(root))?;
+    result
 }
 
 /// Saves an entity's NBT, adding a player's held item as `SelectedItem`, matching
@@ -395,6 +426,34 @@ impl DataAccessor for StorageDataAccessor {
         Ok(storage.get(&self.id).cloned().unwrap_or_default())
     }
 
+    fn read(&self, f: &mut dyn FnMut(&NbtTag)) -> Result<(), CommandSyntaxError> {
+        self.modify(&mut |root| {
+            f(root);
+            Ok(0)
+        })
+        .map(|_| ())
+    }
+
+    fn modify(
+        &self,
+        f: &mut dyn FnMut(&mut NbtTag) -> Result<i32, CommandSyntaxError>,
+    ) -> Result<i32, CommandSyntaxError> {
+        let mut storage = self
+            .server
+            .command_storage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Move the compound out instead of copying it; it goes back whatever `f` returns.
+        let mut root = NbtTag::Compound(storage.remove(&self.id).unwrap_or_default());
+        let result = f(&mut root);
+        if let NbtTag::Compound(data) = root
+            && !data.is_empty()
+        {
+            storage.insert(self.id.clone(), data);
+        }
+        result
+    }
+
     fn get_modified_success(&self) -> TextComponent {
         TextComponent::translate_cross(
             translation::java::COMMANDS_DATA_STORAGE_MODIFIED,
@@ -432,9 +491,7 @@ pub fn get_single_tag(
     path: &NbtPath,
     accessor: &dyn DataAccessor,
 ) -> Result<NbtTag, CommandSyntaxError> {
-    let data = accessor.get_data()?;
-    let root = NbtTag::Compound(data);
-    let tags = path.get(&root)?;
+    let tags = read_path(accessor, path)?;
     match tags.len() {
         0 => Err(ERROR_GET_NON_EXISTENT
             .create_without_context(TextComponent::text(path.as_str().to_string()))),
@@ -612,16 +669,10 @@ fn execute_merge(context: &CommandContext, target_kind: TargetKind) -> CommandEx
 fn execute_remove(context: &CommandContext, target_kind: TargetKind) -> CommandExecutorResult {
     let accessor = target_kind.access(context, "target")?;
     let path = context.get_argument::<NbtPath>("path")?;
-    let mut data = accessor.get_data()?;
-    let mut root = NbtTag::Compound(data.clone());
-    let count = path.remove(&mut root);
-    if count == 0 {
-        return Err(ERROR_MERGE_UNCHANGED.create_without_context());
-    }
-    if let NbtTag::Compound(new_compound) = root {
-        data = new_compound;
-    }
-    accessor.set_data(&data)?;
+    let count = accessor.modify(&mut |root| match path.remove(root) {
+        0 => Err(ERROR_MERGE_UNCHANGED.create_without_context()),
+        count => Ok(count),
+    })?;
     context
         .source
         .send_feedback(accessor.get_modified_success(), true);
@@ -662,12 +713,11 @@ fn resolve_source_tags(
         }
         SourceMode::From { has_path } => {
             let source_accessor = source_kind.unwrap().access(context, "source")?;
-            let data = source_accessor.get_data()?;
             if has_path {
                 let source_path = context.get_argument::<NbtPath>("sourcePath")?;
-                source_path.get(&NbtTag::Compound(data))
+                read_path(source_accessor.as_ref(), source_path)
             } else {
-                Ok(vec![NbtTag::Compound(data)])
+                Ok(vec![NbtTag::Compound(source_accessor.get_data()?)])
             }
         }
         SourceMode::String {
@@ -676,12 +726,11 @@ fn resolve_source_tags(
             has_end,
         } => {
             let source_accessor = source_kind.unwrap().access(context, "source")?;
-            let data = source_accessor.get_data()?;
             let tags = if has_path {
                 let source_path = context.get_argument::<NbtPath>("sourcePath")?;
-                source_path.get(&NbtTag::Compound(data))?
+                read_path(source_accessor.as_ref(), source_path)?
             } else {
-                vec![NbtTag::Compound(data)]
+                vec![NbtTag::Compound(source_accessor.get_data()?)]
             };
 
             let start = if has_start {
@@ -715,46 +764,47 @@ fn execute_modify(
 ) -> CommandExecutorResult {
     let target_accessor = target_kind.access(context, "target")?;
     let target_path = context.get_argument::<NbtPath>("targetPath")?;
-    let mut target_data = target_accessor.get_data()?;
-    let mut root = NbtTag::Compound(target_data.clone());
+    // Read the source first: it may be the same storage as the target.
     let source_tags = resolve_source_tags(context, source_kind, source_mode)?;
-
-    let result = match modify_mode {
-        ModifyMode::Insert(idx) => target_path.insert(idx, &mut root, &source_tags)?,
-        ModifyMode::Prepend => target_path.insert(0, &mut root, &source_tags)?,
-        ModifyMode::Append => target_path.insert(-1, &mut root, &source_tags)?,
-        ModifyMode::Set => {
-            let last_tag = source_tags.last().cloned().unwrap_or(NbtTag::End);
-            target_path.set(&mut root, last_tag)?
-        }
-        ModifyMode::Merge => {
-            let mut combined = NbtCompound::new();
-            for tag in &source_tags {
-                if is_too_deep(tag, 0) {
-                    return Err(ERROR_DATA_TOO_DEEP.create_without_context());
-                }
-                if let NbtTag::Compound(c) = tag {
-                    for (k, v) in &c.child_tags {
-                        combined.child_tags.insert(k.clone(), v.clone());
-                    }
-                } else {
-                    return Err(ERROR_EXPECTED_OBJECT
-                        .create_without_context(TextComponent::text(format!("{tag:?}"))));
-                }
+    if matches!(modify_mode, ModifyMode::Merge) {
+        for tag in &source_tags {
+            if is_too_deep(tag, 0) {
+                return Err(ERROR_DATA_TOO_DEEP.create_without_context());
             }
-
-            target_path.set(&mut root, NbtTag::Compound(combined))?
         }
-    };
-
-    if result == 0 {
-        return Err(ERROR_MERGE_UNCHANGED.create_without_context());
     }
 
-    if let NbtTag::Compound(new_compound) = root {
-        target_data = new_compound;
-    }
-    target_accessor.set_data(&target_data)?;
+    let result = target_accessor.modify(&mut |root| {
+        let result = match modify_mode {
+            ModifyMode::Insert(idx) => target_path.insert(idx, root, &source_tags)?,
+            ModifyMode::Prepend => target_path.insert(0, root, &source_tags)?,
+            ModifyMode::Append => target_path.insert(-1, root, &source_tags)?,
+            ModifyMode::Set => {
+                let last_tag = source_tags.last().cloned().unwrap_or(NbtTag::End);
+                target_path.set(root, last_tag)?
+            }
+            ModifyMode::Merge => {
+                let mut combined = NbtCompound::new();
+                for tag in &source_tags {
+                    if let NbtTag::Compound(c) = tag {
+                        for (k, v) in &c.child_tags {
+                            combined.child_tags.insert(k.clone(), v.clone());
+                        }
+                    } else {
+                        return Err(ERROR_EXPECTED_OBJECT
+                            .create_without_context(TextComponent::text(format!("{tag:?}"))));
+                    }
+                }
+
+                target_path.set(root, NbtTag::Compound(combined))?
+            }
+        };
+
+        if result == 0 {
+            return Err(ERROR_MERGE_UNCHANGED.create_without_context());
+        }
+        Ok(result)
+    })?;
     context
         .source
         .send_feedback(target_accessor.get_modified_success(), true);

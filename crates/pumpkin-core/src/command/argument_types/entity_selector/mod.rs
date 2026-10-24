@@ -8,6 +8,7 @@ use crate::command::context::command_source::CommandSource;
 use crate::command::errors::command_syntax_error::CommandSyntaxError;
 use crate::entity::EntityBase;
 use crate::entity::player::Player;
+use crate::entity::tag_index;
 use crate::world::World;
 use pumpkin_data::Advancement;
 use pumpkin_data::entity::EntityType;
@@ -28,6 +29,9 @@ use uuid::Uuid;
 ///
 /// Not all selectors represented by this object start with `@`; this is also used for
 /// selectors like *plain player names* and *bare UUIDs*.
+/// Above this many candidates, a selector with a bounding box uses the spatial index.
+const MAX_BOXED_CANDIDATES: usize = 64;
+
 pub struct EntitySelector {
     /// The maximum number of possible entities that can be selected.
     pub max_selected: i32,
@@ -96,6 +100,28 @@ impl EntitySelector {
         &self,
         source: &CommandSource,
     ) -> Result<Vec<Arc<dyn EntityBase>>, CommandSyntaxError> {
+        self.find_entities_hinted(source, None)
+    }
+
+    /// Like [`Self::find_entities`], for a caller that ignores every entity without
+    /// `tag` (e.g. `tag @e remove x`). Entities lacking the tag may still be returned,
+    /// but the search starts from the tag index instead of every entity in the world.
+    /// The hint is dropped for limited selectors, where it would change which entities
+    /// get picked.
+    pub fn find_entities_with_tag_hint(
+        &self,
+        source: &CommandSource,
+        tag: &str,
+    ) -> Result<Vec<Arc<dyn EntityBase>>, CommandSyntaxError> {
+        let hint = (self.max_selected == i32::MAX && !tag.is_empty()).then_some(tag);
+        self.find_entities_hinted(source, hint)
+    }
+
+    fn find_entities_hinted(
+        &self,
+        source: &CommandSource,
+        tag_hint: Option<&str>,
+    ) -> Result<Vec<Arc<dyn EntityBase>>, CommandSyntaxError> {
         self.check_permissions(source)?;
         if !self.includes_entities {
             self.find_players(source)
@@ -128,10 +154,16 @@ impl EntitySelector {
             } else {
                 let mut list = Vec::new();
                 if self.is_world_limited {
-                    self.add_entities(&mut list, source.world().as_ref(), bounding_box, &predicate);
+                    self.add_entities(
+                        &mut list,
+                        source.world().as_ref(),
+                        bounding_box,
+                        &predicate,
+                        tag_hint,
+                    );
                 } else {
                     for world in source.server().worlds.load().iter() {
-                        self.add_entities(&mut list, world, bounding_box, &predicate);
+                        self.add_entities(&mut list, world, bounding_box, &predicate, tag_hint);
                     }
                 }
 
@@ -146,13 +178,84 @@ impl EntitySelector {
         world: &World,
         bounding_box: Option<BoundingBox>,
         predicate: &EntitySelectorPredicate,
+        tag_hint: Option<&str>,
     ) {
         let limit = self.result_limit();
-        if let Some(b) = bounding_box {
+        if let Some(candidates) = self.candidate_entity_ids(world, tag_hint)
+            // A small box is already answered by the spatial index; only prefer the
+            // candidate list when it is short.
+            && (bounding_box.is_none() || candidates.len() <= MAX_BOXED_CANDIDATES)
+        {
+            world.extend_entities_from_candidates(list, limit, &candidates, bounding_box, |e| {
+                predicate.test(e)
+            });
+        } else if let Some(b) = bounding_box {
             world.extend_entities_in_box_where(list, limit, b, |e| predicate.test(e));
         } else {
             world.extend_entities_where(list, limit, |e| predicate.test(e));
         }
+    }
+
+    /// Returns the ids of the only non-player entities in `world` that can match this
+    /// selector, taken from the tag index (`tag=`) or the scoreboard (`scores=`),
+    /// whichever is smaller. `None` when neither narrows the search.
+    fn candidate_entity_ids(&self, world: &World, tag_hint: Option<&str>) -> Option<Vec<i32>> {
+        let mut best: Option<Vec<i32>> = None;
+        let mut best_len = usize::MAX;
+        if let Some(tag) = tag_hint {
+            best_len = tag_index::count(tag);
+            best = Some(tag_index::entities_with(tag));
+        }
+        for predicate in &self.predicates {
+            if let EntitySelectorPredicate::Tag(tag, false) = predicate
+                && !tag.is_empty()
+            {
+                let len = tag_index::count(tag);
+                if len < best_len {
+                    best = Some(tag_index::entities_with(tag));
+                    best_len = len;
+                }
+            }
+        }
+        for predicate in &self.predicates {
+            let EntitySelectorPredicate::Scores(scores) = predicate else {
+                continue;
+            };
+            let lookup = world.entity_lookup();
+            let scoreboard = world
+                .scoreboard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (objective, bounds) in scores {
+                // A holder without a score in the objective never matches, so the
+                // objective's matching holders are a complete candidate set.
+                let Some(holders) = scoreboard.get_scores_for_objective(objective) else {
+                    return Some(Vec::new());
+                };
+                // Only the holders whose score is in range are candidates (e.g. the dozen
+                // parts of one car out of thousands), so measure those, not the objective.
+                let matching = holders
+                    .values()
+                    .filter(|score| bounds.matches(score.value.0))
+                    .count();
+                if matching >= best_len {
+                    continue;
+                }
+                let mut ids: Vec<i32> = holders
+                    .iter()
+                    .filter(|(_, score)| bounds.matches(score.value.0))
+                    .filter_map(|(holder, _)| Uuid::try_parse(holder).ok())
+                    .filter_map(|uuid| lookup.get_by_uuid(&uuid))
+                    .map(|entity| entity.get_entity().entity_id)
+                    .collect();
+                if ids.len() < best_len {
+                    ids.sort_unstable();
+                    best_len = ids.len();
+                    best = Some(ids);
+                }
+            }
+        }
+        best
     }
 
     /// Tries to find a single player represented by this selector.

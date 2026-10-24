@@ -195,7 +195,7 @@ fn bedrock_chest_block_actor(state_id: BlockStateId, position: BlockPos) -> Opti
     crate::block::entities::bedrock::build_chest_actor(position, state_id, None)
 }
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 impl PumpkinError for GetBlockError {
     fn is_kick(&self) -> bool {
@@ -208,6 +208,49 @@ impl PumpkinError for GetBlockError {
 
     fn client_kick_reason(&self) -> Option<String> {
         None
+    }
+}
+
+/// Index maps from entity id and UUID to positions in one `World::entities` list.
+struct EntityIndexMaps {
+    by_id: FxHashMap<i32, usize>,
+    by_uuid: FxHashMap<uuid::Uuid, usize>,
+}
+
+/// The maps cached for the list they were built from. The list is held weakly so
+/// that the cache never keeps removed entities alive.
+type EntityLookupCache = Option<(Weak<Vec<Arc<dyn EntityBase>>>, Arc<EntityIndexMaps>)>;
+
+/// Hash lookups into one snapshot of [`World::entities`].
+pub(crate) struct EntityLookup {
+    #[expect(
+        clippy::rc_buffer,
+        reason = "shares the snapshot World::entities hands out"
+    )]
+    entities: Arc<Vec<Arc<dyn EntityBase>>>,
+    maps: Arc<EntityIndexMaps>,
+}
+
+impl EntityIndexMaps {
+    fn build(entities: &[Arc<dyn EntityBase>]) -> Self {
+        let mut by_id = FxHashMap::with_capacity_and_hasher(entities.len(), FxBuildHasher);
+        let mut by_uuid = FxHashMap::with_capacity_and_hasher(entities.len(), FxBuildHasher);
+        for (i, entity) in entities.iter().enumerate() {
+            let base = entity.get_entity();
+            by_id.insert(base.entity_id, i);
+            by_uuid.entry(base.entity_uuid).or_insert(i);
+        }
+        Self { by_id, by_uuid }
+    }
+}
+
+impl EntityLookup {
+    pub(crate) fn get_by_id(&self, id: i32) -> Option<&Arc<dyn EntityBase>> {
+        self.maps.by_id.get(&id).map(|&i| &self.entities[i])
+    }
+
+    pub(crate) fn get_by_uuid(&self, uuid: &uuid::Uuid) -> Option<&Arc<dyn EntityBase>> {
+        self.maps.by_uuid.get(uuid).map(|&i| &self.entities[i])
     }
 }
 
@@ -233,6 +276,8 @@ pub struct World {
     /// This does not include players.
     pub entities: ArcSwap<Vec<Arc<dyn EntityBase>>>,
     pub(crate) entity_index: Arc<EntityIndex>,
+    /// Id and UUID lookup over `entities`, rebuilt lazily whenever the list changes.
+    entity_lookup: std::sync::Mutex<EntityLookupCache>,
     island_schedule: std::sync::Mutex<entity_islands::Schedule>,
     /// The world's scoreboard, used for tracking scores, objectives, and display information.
     pub scoreboard: std::sync::Mutex<Scoreboard>,
@@ -399,6 +444,7 @@ impl World {
             players: ArcSwap::new(Arc::new(Vec::new())),
             entities: ArcSwap::new(Arc::new(Vec::new())),
             entity_index: Arc::default(),
+            entity_lookup: std::sync::Mutex::new(None),
             island_schedule: std::sync::Mutex::default(),
             scoreboard: std::sync::Mutex::new(Scoreboard::default()),
             worldborder: std::sync::Mutex::new(Worldborder::new(
@@ -4544,13 +4590,34 @@ impl World {
         None
     }
 
+    /// Returns hash lookups over the current entity list, rebuilding them only
+    /// when the list was replaced since the last call.
+    pub(crate) fn entity_lookup(&self) -> EntityLookup {
+        let entities = self.entities.load_full();
+        let mut cached = self
+            .entity_lookup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((list, maps)) = cached.as_ref()
+            && list
+                .upgrade()
+                .is_some_and(|list| Arc::ptr_eq(&list, &entities))
+        {
+            return EntityLookup {
+                entities,
+                maps: maps.clone(),
+            };
+        }
+        let maps = Arc::new(EntityIndexMaps::build(&entities));
+        *cached = Some((Arc::downgrade(&entities), maps.clone()));
+        EntityLookup { entities, maps }
+    }
+
     /// Gets an entity by an entity id
     pub fn get_entity_by_id(&self, id: i32) -> Option<Arc<dyn EntityBase>> {
-        for entity in self.entities.load().iter() {
-            if entity.get_entity().entity_id == id {
-                entity_islands::check_reached(id);
-                return Some(entity.clone());
-            }
+        if let Some(entity) = self.entity_lookup().get_by_id(id) {
+            entity_islands::check_reached(id);
+            return Some(entity.clone());
         }
         for player in self.players.load().iter() {
             if player.get_entity().entity_id == id {
@@ -4640,10 +4707,8 @@ impl World {
     ///
     /// An `Option<Arc<dyn EntityBase>>` containing the player if found, or `None` if not.
     pub fn get_entity_by_uuid(&self, id: uuid::Uuid) -> Option<Arc<dyn EntityBase>> {
-        self.entities
-            .load()
-            .iter()
-            .find(|p| p.get_entity().entity_uuid == id)
+        self.entity_lookup()
+            .get_by_uuid(&id)
             .inspect(|entity| entity_islands::check_reached(entity.get_entity().entity_id))
             .cloned()
     }
@@ -4821,6 +4886,47 @@ impl World {
             if predicate(entity.as_ref()) {
                 entity_islands::check_reached(entity.get_entity().entity_id);
                 list.push(entity);
+                if list.len() > max_list_capacity {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Like [`Self::extend_entities_where`], but only non-player entities whose ids are
+    /// in `candidate_ids` are considered (players are always all checked). The caller
+    /// guarantees every non-player entity that could match is a candidate.
+    pub fn extend_entities_from_candidates(
+        &self,
+        list: &mut Vec<Arc<dyn EntityBase>>,
+        max_list_capacity: usize,
+        candidate_ids: &[i32],
+        bounding_box: Option<BoundingBox>,
+        predicate: impl Fn(&dyn EntityBase) -> bool,
+    ) {
+        if list.len() >= max_list_capacity {
+            return;
+        }
+        let in_box = |entity: &dyn EntityBase| {
+            bounding_box.is_none_or(|b| b.intersects(&entity.get_entity().bounding_box.load()))
+        };
+        for player in self.players.load().iter() {
+            if in_box(player.as_ref()) && predicate(player.as_ref()) {
+                entity_islands::check_reached(player.entity_id());
+                list.push(player.clone());
+                if list.len() > max_list_capacity {
+                    return;
+                }
+            }
+        }
+        let lookup = self.entity_lookup();
+        for &id in candidate_ids {
+            let Some(entity) = lookup.get_by_id(id) else {
+                continue;
+            };
+            if in_box(entity.as_ref()) && predicate(entity.as_ref()) {
+                entity_islands::check_reached(id);
+                list.push(entity.clone());
                 if list.len() > max_list_capacity {
                     return;
                 }

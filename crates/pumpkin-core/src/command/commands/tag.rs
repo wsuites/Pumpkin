@@ -8,6 +8,7 @@ use pumpkin_util::text::TextComponent;
 use crate::command::argument_builder::{ArgumentBuilder, argument, command, literal};
 use crate::command::argument_types::core::string::StringArgumentType;
 use crate::command::argument_types::entity::EntityArgumentType;
+use crate::command::argument_types::entity_selector::EntitySelector;
 use crate::command::context::command_context::CommandContext;
 use crate::command::errors::error_types::CommandErrorType;
 use crate::command::node::dispatcher::CommandDispatcher;
@@ -40,12 +41,39 @@ struct ChangeExecutor(Action);
 
 impl CommandExecutor for ChangeExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let targets = EntityArgumentType::get_entities(context, ARG_TARGETS)?;
         let tag = StringArgumentType::get(context, ARG_NAME)?.to_owned();
+        let targets = if matches!(self.0, Action::Remove) {
+            // Only entities carrying the tag can lose it, so search from the tag index
+            // instead of collecting every entity in the world.
+            let entities = context
+                .get_argument::<EntitySelector>(ARG_TARGETS)?
+                .find_entities_with_tag_hint(context.source.as_ref(), &tag)?;
+            if entities.is_empty() {
+                return Err(REMOVE_FAILED_ERROR_TYPE.create_without_context());
+            }
+            entities
+        } else {
+            EntityArgumentType::get_entities(context, ARG_TARGETS)?
+        };
+
+        // `tag @e remove x` runs every tick in many datapacks; only the entities the
+        // index lists can lose the tag, so skip locking every other entity.
+        let tagged: Option<rustc_hash::FxHashSet<i32>> =
+            matches!(self.0, Action::Remove).then(|| {
+                crate::entity::tag_index::entities_with(&tag)
+                    .into_iter()
+                    .collect()
+            });
 
         let mut changed = 0;
         for target in &targets {
             let entity = target.get_entity();
+            if tagged
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(&entity.entity_id))
+            {
+                continue;
+            }
             let success = match self.0 {
                 Action::Add => entity.add_scoreboard_tag(&tag),
                 Action::Remove => entity.remove_scoreboard_tag(&tag),
