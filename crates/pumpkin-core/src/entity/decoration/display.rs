@@ -3,7 +3,9 @@ use std::sync::{
     atomic::{AtomicI8, AtomicI32, AtomicU8, Ordering},
 };
 
-use pumpkin_data::{damage::DamageType, item_stack::ItemStack};
+use pumpkin_data::{
+    Block, BlockStateId, damage::DamageType, item_stack::ItemStack,
+};
 use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
 use pumpkin_protocol::{
     codec::{item_stack_seralizer::ItemStackSerializer, var_int::VarInt},
@@ -688,6 +690,30 @@ impl DisplayEntity {
     }
 }
 
+/// Writes a block state the way vanilla's `BlockState.CODEC` does: `{Name:..,Properties:{..}}`.
+fn block_state_to_nbt(state: i32) -> NbtCompound {
+    let id = BlockStateId::new_or_air(u16::try_from(state).unwrap_or(0));
+    let block = Block::from_state_id(id);
+    let mut comp = NbtCompound::new();
+    let name = if block.name.contains(':') {
+        block.name.to_string()
+    } else {
+        format!("minecraft:{}", block.name)
+    };
+    comp.put_string("Name", name);
+    if let Some(props) = block.properties(id) {
+        let props = props.to_props();
+        if !props.is_empty() {
+            let mut props_comp = NbtCompound::new();
+            for p in props {
+                props_comp.put_string(p.key_str(), p.value_str().to_string());
+            }
+            comp.put_compound("Properties", props_comp);
+        }
+    }
+    comp
+}
+
 pub struct BlockDisplayEntity {
     pub display: DisplayEntity,
     pub block_state: AtomicI32,
@@ -717,12 +743,21 @@ impl BlockDisplayEntity {
 impl EntityBase for BlockDisplayEntity {
     fn write_custom_nbt(&self, nbt: &mut NbtCompound) {
         self.display.write_display_nbt(nbt);
-        nbt.put_int("block_state", self.block_state.load(Ordering::Relaxed));
+        nbt.put_compound(
+            "block_state",
+            block_state_to_nbt(self.block_state.load(Ordering::Relaxed)),
+        );
     }
 
     fn read_custom_nbt(&self, nbt: &NbtCompound) {
         self.display.read_display_nbt(nbt);
-        if let Some(state) = nbt.get_int("block_state") {
+        // Vanilla stores `{Name:..,Properties:{..}}`; older Pumpkin saves used the raw id.
+        let state = match nbt.get("block_state") {
+            Some(NbtTag::Int(id)) => Some(*id),
+            Some(tag) => crate::command::commands::particle::block_state_id(tag).map(i32::from),
+            None => None,
+        };
+        if let Some(state) = state {
             self.block_state.store(state, Ordering::Relaxed);
         }
     }

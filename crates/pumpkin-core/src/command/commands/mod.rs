@@ -47,7 +47,7 @@ mod msg;
 mod op;
 mod pardon;
 mod pardonip;
-mod particle;
+pub(crate) mod particle;
 mod place;
 mod playsound;
 mod plugin;

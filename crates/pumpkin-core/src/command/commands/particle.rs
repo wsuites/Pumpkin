@@ -77,7 +77,7 @@ fn color_from_floats(parts: impl Iterator<Item = Option<f32>>) -> Option<i32> {
 }
 
 /// Resolves a vanilla block state (`"minecraft:stone"` or `{Name:..,Properties:{..}}`) to its id.
-fn block_state_id(tag: &NbtTag) -> Option<u16> {
+pub fn block_state_id(tag: &NbtTag) -> Option<u16> {
     let (name, props) = match tag {
         NbtTag::String(name) => (name.to_string(), None),
         NbtTag::Compound(c) => (
