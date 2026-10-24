@@ -1382,6 +1382,16 @@ impl TextComponent {
     /// Parses a text component from its NBT representation
     #[must_use]
     pub fn from_nbt(tag: &pumpkin_nbt::tag::NbtTag) -> Self {
+        // Datapacks made for 1.21.4 and older store components as JSON strings.
+        // Decode those instead of showing the raw JSON as literal text.
+        if let pumpkin_nbt::tag::NbtTag::String(value) = tag {
+            let trimmed = value.trim_start();
+            if (trimmed.starts_with('{') || trimmed.starts_with('['))
+                && let Ok(component) = serde_json::from_str::<Self>(value)
+            {
+                return component;
+            }
+        }
         serde_json::from_value(nbt_tag_to_json(tag)).unwrap_or_else(|_| Self::empty())
     }
 
@@ -2283,6 +2293,24 @@ mod test {
 mod custom_name_nbt_tests {
     use super::TextComponent;
     use pumpkin_nbt::tag::NbtTag;
+
+    #[test]
+    fn legacy_json_string_tag_is_decoded() {
+        let tag = NbtTag::String(r#"{"text":"Car","color":"blue","italic":false}"#.into());
+        let component = TextComponent::from_nbt(&tag);
+        assert!(component.0.style.color.is_some());
+        assert_eq!(component.get_text(), "Car");
+    }
+
+    #[test]
+    fn list_tag_joins_components() {
+        let mut first = pumpkin_nbt::compound::NbtCompound::new();
+        first.put_string("text", "D".to_string());
+        let mut second = pumpkin_nbt::compound::NbtCompound::new();
+        second.put_string("text", "rive".to_string());
+        let tag = NbtTag::List(vec![NbtTag::Compound(first), NbtTag::Compound(second)]);
+        assert_eq!(TextComponent::from_nbt(&tag).get_text(), "Drive");
+    }
 
     #[test]
     fn plain_string_tag_is_literal_text() {
