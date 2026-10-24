@@ -228,11 +228,7 @@ impl LoreImpl {
         };
 
         Some(Self {
-            lines: lines
-                .iter()
-                .filter_map(NbtTag::extract_string)
-                .map(|line| TextComponent::text(line.to_owned()))
-                .collect(),
+            lines: lines.iter().map(TextComponent::from_nbt).collect(),
         })
     }
 }
@@ -241,7 +237,7 @@ impl DataComponentImpl for LoreImpl {
         NbtTag::List(
             self.lines
                 .iter()
-                .map(|line| NbtTag::String(line.clone().get_text().into_boxed_str()))
+                .map(|line| line.to_nbt_tag_for_version(&JavaMinecraftVersion::V_26_2))
                 .collect(),
         )
     }

@@ -59,8 +59,18 @@ fn read_components(reader: &mut StringReader) -> Result<ComponentPatch, CommandS
             reader.expect('=')?;
             reader.skip_whitespace();
             let start = reader.cursor();
-            let tag = SnbtParser::parse_for_commands(reader)?;
+            let mut tag = SnbtParser::parse_for_commands(reader)?;
             let end = reader.cursor();
+            // Like vanilla, `custom_data` also accepts its compound written as an SNBT string.
+            if component == DataComponent::CustomData
+                && let pumpkin_nbt::tag::NbtTag::String(snbt) = &tag
+            {
+                let snbt = snbt.to_string();
+                let mut inner = StringReader::new(&snbt);
+                if let Ok(parsed) = SnbtParser::parse_for_commands(&mut inner) {
+                    tag = parsed;
+                }
+            }
             let value = read_data(component, &tag).ok_or_else(|| {
                 reader.set_cursor(start);
                 ERROR_MALFORMED_COMPONENT.create(
