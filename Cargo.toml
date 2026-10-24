@@ -151,6 +151,14 @@ codegen-units = 16
 [profile.release.package.pumpkin-wasm-host-v0_2]
 codegen-units = 16
 
+# Fast optimized build for iterating on a server: thin LTO, parallel codegen and incremental
+# compilation keep almost all of release's runtime speed at a fraction of its build time.
+[profile.fast-release]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true
+
 [profile.bench]
 debug = true
 
