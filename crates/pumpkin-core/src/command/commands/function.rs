@@ -146,21 +146,27 @@ impl CommandExecutor for FunctionExecutor {
         let executed_count = result.executed;
         pumpkin_command::context::command_context::skip_result_callbacks();
 
+        // Like vanilla 26.3, report which functions ran; the client dropped the
+        // `commands.function.success.*` keys.
         context.source.send_feedback_with(
             || {
-                let key = if name_str.starts_with('#') {
-                    translation::java::COMMANDS_FUNCTION_SUCCESS_MULTIPLE
+                let functions = server
+                    .datapack_manager
+                    .function_tag_members(name_str)
+                    .unwrap_or_else(|| vec![name_str.to_string()]);
+                if let [single] = functions.as_slice() {
+                    TextComponent::translate_cross(
+                        translation::java::COMMANDS_FUNCTION_SCHEDULED_SINGLE,
+                        translation::java::COMMANDS_FUNCTION_SCHEDULED_SINGLE,
+                        [TextComponent::text(single.clone())],
+                    )
                 } else {
-                    translation::java::COMMANDS_FUNCTION_SUCCESS_SINGLE
-                };
-                TextComponent::translate_cross(
-                    key,
-                    key,
-                    [
-                        TextComponent::text(executed_count.to_string()),
-                        TextComponent::text(name_str.to_string()),
-                    ],
-                )
+                    TextComponent::translate_cross(
+                        translation::java::COMMANDS_FUNCTION_SCHEDULED_MULTIPLE,
+                        translation::java::COMMANDS_FUNCTION_SCHEDULED_MULTIPLE,
+                        [TextComponent::text(functions.join(", "))],
+                    )
+                }
             },
             true,
         );
