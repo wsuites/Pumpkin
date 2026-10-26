@@ -158,6 +158,28 @@ inherits = "release"
 lto = "thin"
 codegen-units = 16
 incremental = true
+# Line tables let samply and other profilers resolve stacks without a separate build. Kept fixed so
+# switching between profiling and plain runs never rebuilds the whole tree.
+debug = "line-tables-only"
+strip = false
+
+# External dependencies keep their existing artifacts; only Pumpkin's own crates carry line tables.
+[profile.fast-release.package."*"]
+debug = false
+
+# Quick iteration build for comparing before/after: no LTO and wide codegen. Absolute timings are a
+# bit worse than fast-release, relative comparisons stay valid.
+[profile.iter]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 256
+incremental = true
+debug = "line-tables-only"
+strip = false
+
+[profile.iter.package."*"]
+debug = false
 
 [profile.bench]
 debug = true
