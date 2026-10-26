@@ -252,11 +252,11 @@ impl scoreboard::HostScoreboard for PluginHostState {
                 ScoreboardProvider::World(world) => world
                     .scoreboard
                     .lock_ignore_poison()
-                    .add_score(world.as_ref(), entity_name, objective_name, delta),
+                    .add_score(world.as_ref(), &entity_name, &objective_name, delta),
                 ScoreboardProvider::Player(player) => {
                     let mut custom_guard = player.custom_scoreboard.lock_ignore_poison();
                     let sb = java_scoreboard(&mut custom_guard)?;
-                    sb.add_score(player.as_ref(), entity_name, objective_name, delta)
+                    sb.add_score(player.as_ref(), &entity_name, &objective_name, delta)
                 }
             };
         Ok(new_val)
@@ -996,7 +996,7 @@ impl HostBedrockScoreboard for PluginHostState {
         let player = self.get(&res)?.clone();
         let mut custom_guard = player.custom_scoreboard.lock_ignore_poison();
         let sb = bedrock_scoreboard(&mut custom_guard)?;
-        let new_val = sb.add_score(player.as_ref(), entity_name, objective_name, delta);
+        let new_val = sb.add_score(player.as_ref(), &entity_name, &objective_name, delta);
         Ok(new_val)
     }
 

@@ -23,7 +23,7 @@ impl CommandExecutor for Executor {
 
         context.server().broadcast_message(
             &TextComponent::text(msg.clone()),
-            &context.source.display_name,
+            &context.source.display_name(),
             SAY_COMMAND,
             None,
         );

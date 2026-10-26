@@ -20,6 +20,7 @@ use pumpkin_data::translation;
 use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_nbt::tag::NbtTag;
 use pumpkin_util::text::TextComponent;
+use std::borrow::Cow;
 
 use crate::argument_types::argument_type::{ArgumentType, JavaClientArgumentType};
 use crate::context::command_context::CommandContext;
@@ -214,6 +215,68 @@ impl NbtPathNode {
         }
     }
 
+    /// Like [`Self::get_tag`], but borrows the selected tags from `parent`.
+    fn get_tag_ref<'a>(&self, parent: &'a NbtTag, output: &mut Vec<Cow<'a, NbtTag>>) {
+        match self {
+            Self::AllElements => match parent {
+                NbtTag::List(list) => output.extend(list.iter().map(Cow::Borrowed)),
+                NbtTag::ByteArray(_) | NbtTag::IntArray(_) | NbtTag::LongArray(_) => {
+                    let mut owned = Vec::new();
+                    self.get_tag(parent, &mut owned);
+                    output.extend(owned.into_iter().map(Cow::Owned));
+                }
+                _ => {}
+            },
+            Self::CompoundChild(name) => {
+                if let NbtTag::Compound(compound) = parent
+                    && let Some(tag) = compound.child_tags.get(name.as_str())
+                {
+                    output.push(Cow::Borrowed(tag));
+                }
+            }
+            Self::IndexedElement(index) => {
+                if let NbtTag::List(list) = parent {
+                    let size = list.len() as i32;
+                    let actual_index = if *index < 0 { size + index } else { *index };
+                    if let Ok(i) = usize::try_from(actual_index)
+                        && let Some(tag) = list.get(i)
+                    {
+                        output.push(Cow::Borrowed(tag));
+                    }
+                } else {
+                    let mut owned = Vec::new();
+                    self.get_tag(parent, &mut owned);
+                    output.extend(owned.into_iter().map(Cow::Owned));
+                }
+            }
+            Self::MatchElement(pattern) => {
+                if let NbtTag::List(list) = parent {
+                    let pattern_tag = NbtTag::Compound(pattern.clone());
+                    output.extend(
+                        list.iter()
+                            .filter(|elem| compare_nbt(&pattern_tag, elem))
+                            .map(Cow::Borrowed),
+                    );
+                }
+            }
+            Self::MatchObject(name, pattern) => {
+                if let NbtTag::Compound(compound) = parent
+                    && let Some(tag) = compound.child_tags.get(name.as_str())
+                    && compare_nbt(&NbtTag::Compound(pattern.clone()), tag)
+                {
+                    output.push(Cow::Borrowed(tag));
+                }
+            }
+            Self::MatchRootObject(pattern) => {
+                if matches!(parent, NbtTag::Compound(_))
+                    && compare_nbt(&NbtTag::Compound(pattern.clone()), parent)
+                {
+                    output.push(Cow::Borrowed(parent));
+                }
+            }
+        }
+    }
+
     pub fn create_preferred_parent_tag(&self) -> NbtTag {
         match self {
             Self::AllElements | Self::IndexedElement(_) | Self::MatchElement(_) => {
@@ -252,10 +315,13 @@ impl NbtPathNode {
             Self::CompoundChild(name) => {
                 if let NbtTag::Compound(compound) = parent {
                     let new_val = to_add();
-                    let prev = compound
-                        .child_tags
-                        .insert(name.clone().into(), new_val.clone());
-                    i32::from(prev.as_ref() != Some(&new_val))
+                    // Compare first so an unchanged value costs no clone.
+                    if compound.child_tags.get(name.as_str()) == Some(&new_val) {
+                        0
+                    } else {
+                        compound.child_tags.insert(name.clone().into(), new_val);
+                        1
+                    }
                 } else {
                     0
                 }
@@ -422,34 +488,34 @@ impl NbtPath {
 
     /// Gets matching tags from the given root tag.
     pub fn get(&self, tag: &NbtTag) -> Result<Vec<NbtTag>, CommandSyntaxError> {
-        let mut current = vec![tag.clone()];
-        for (i, node) in self.nodes.iter().enumerate() {
-            let mut next = Vec::new();
-            for parent in &current {
-                node.get_tag(parent, &mut next);
-            }
-            if next.is_empty() {
-                return Err(self.create_not_found_exception(i));
-            }
-            current = next;
-        }
-        Ok(current)
+        self.walk(tag)
+            .map(|found| found.into_iter().map(Cow::into_owned).collect())
+            .map_err(|i| self.create_not_found_exception(i))
     }
 
     /// Counts how many elements match the path.
     pub fn count_matching(&self, tag: &NbtTag) -> usize {
-        let mut current = vec![tag.clone()];
-        for node in &self.nodes {
+        self.walk(tag).map_or(0, |found| found.len())
+    }
+
+    /// Follows the path by reference, so only the selected tags are ever copied.
+    /// Fails with the index of the first node that matched nothing.
+    fn walk<'a>(&self, tag: &'a NbtTag) -> Result<Vec<Cow<'a, NbtTag>>, usize> {
+        let mut current = vec![Cow::Borrowed(tag)];
+        for (i, node) in self.nodes.iter().enumerate() {
             let mut next = Vec::new();
             for parent in &current {
-                node.get_tag(parent, &mut next);
+                // Owned entries are array elements: plain numbers, which no node can enter.
+                if let Cow::Borrowed(parent) = parent {
+                    node.get_tag_ref(parent, &mut next);
+                }
             }
             if next.is_empty() {
-                return 0;
+                return Err(i);
             }
             current = next;
         }
-        current.len()
+        Ok(current)
     }
 
     fn get_or_create_parents(

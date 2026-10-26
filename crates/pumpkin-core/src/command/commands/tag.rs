@@ -42,12 +42,11 @@ struct ChangeExecutor(Action);
 impl CommandExecutor for ChangeExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let tag = StringArgumentType::get(context, ARG_NAME)?.to_owned();
+        let selector = context.get_argument::<EntitySelector>(ARG_TARGETS)?;
         let targets = if matches!(self.0, Action::Remove) {
             // Only entities carrying the tag can lose it, so search from the tag index
             // instead of collecting every entity in the world.
-            let entities = context
-                .get_argument::<EntitySelector>(ARG_TARGETS)?
-                .find_entities_with_tag_hint(context.source.as_ref(), &tag)?;
+            let entities = selector.find_entities_with_tag_hint(context.source.as_ref(), &tag)?;
             if entities.is_empty() {
                 return Err(REMOVE_FAILED_ERROR_TYPE.create_without_context());
             }
@@ -57,9 +56,10 @@ impl CommandExecutor for ChangeExecutor {
         };
 
         // `tag @e remove x` runs every tick in many datapacks; only the entities the
-        // index lists can lose the tag, so skip locking every other entity.
+        // index lists can lose the tag, so skip locking every other entity. When the
+        // selector already filtered by the tag there is nothing left to skip.
         let tagged: Option<rustc_hash::FxHashSet<i32>> =
-            matches!(self.0, Action::Remove).then(|| {
+            (matches!(self.0, Action::Remove) && !selector.requires_tag(&tag)).then(|| {
                 crate::entity::tag_index::entities_with(&tag)
                     .into_iter()
                     .collect()
@@ -113,24 +113,30 @@ impl CommandExecutor for ChangeExecutor {
             ),
         };
 
-        let msg = if targets.len() == 1 {
-            TextComponent::translate_cross(
-                single_key.0,
-                single_key.1,
-                [TextComponent::text(tag), targets[0].get_display_name()],
-            )
-        } else {
-            TextComponent::translate_cross(
-                multiple_key.0,
-                multiple_key.1,
-                [
-                    TextComponent::text(tag),
-                    TextComponent::text(targets.len().to_string()),
-                ],
-            )
-        };
-
-        context.source.send_feedback(msg, true);
+        context.source.send_feedback_with(
+            || {
+                if targets.len() == 1 {
+                    TextComponent::translate_cross(
+                        single_key.0,
+                        single_key.1,
+                        [
+                            TextComponent::text(tag.clone()),
+                            targets[0].get_display_name(),
+                        ],
+                    )
+                } else {
+                    TextComponent::translate_cross(
+                        multiple_key.0,
+                        multiple_key.1,
+                        [
+                            TextComponent::text(tag),
+                            TextComponent::text(targets.len().to_string()),
+                        ],
+                    )
+                }
+            },
+            true,
+        );
 
         Ok(changed)
     }

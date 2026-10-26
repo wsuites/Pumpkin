@@ -132,7 +132,7 @@ impl SuggestionProvider for WasmCommandSuggestionProvider {
     fn suggest(&self, context: &CommandContext, builder: SuggestionsBuilder) -> Suggestions {
         let sender = context.source.output.clone();
         let server = self.server.clone();
-        let input = context.input.clone();
+        let input = context.input.to_string();
         let request = SuggestionRequest {
             input: input.clone(),
             cursor: input.len().try_into().unwrap_or(u32::MAX),

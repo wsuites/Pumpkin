@@ -1,5 +1,5 @@
 use crate::argument_builder::{ArgumentBuilder, CommandArgumentBuilder};
-use crate::context::command_context::{CommandContext, CommandContextBuilder, ContextChain};
+use crate::context::command_context::{CommandContext, CommandContextBuilder};
 use crate::errors::command_syntax_error::CommandSyntaxError;
 use crate::errors::error_types::{
     DISPATCHER_EXPECTED_ARGUMENT_SEPARATOR, DISPATCHER_UNKNOWN_ARGUMENT,
@@ -8,6 +8,7 @@ use crate::errors::error_types::{
 use crate::node::Redirection;
 use crate::node::attached::{CommandNodeId, NodeId};
 use crate::node::detached::CommandDetachedNode;
+use crate::node::parse_cache::{CachedParse, ParseCache};
 use crate::node::tree::{NodeIdClassification, ROOT_NODE_ID, Tree};
 use crate::source::{CommandSource, DummySource, ReturnValue};
 use crate::string_reader::StringReader;
@@ -100,6 +101,9 @@ pub struct CommandDispatcher<S: CommandSource = DummySource> {
     /// separate from configuration disables so loading the plugin again can
     /// make its commands available without overriding server configuration.
     inactive_plugin_commands: FxHashSet<String>,
+
+    /// Parses reused by [`Self::execute_input_cached`]. Starts empty on clone.
+    parse_cache: ParseCache<S>,
 }
 
 impl<S: CommandSource> Default for CommandDispatcher<S> {
@@ -123,6 +127,7 @@ impl<S: CommandSource> CommandDispatcher<S> {
             consumer: Arc::new(ResultDeferrer),
             disabled: FxHashSet::default(),
             inactive_plugin_commands: FxHashSet::default(),
+            parse_cache: ParseCache::default(),
         }
     }
 
@@ -134,12 +139,14 @@ impl<S: CommandSource> CommandDispatcher<S> {
     /// so that it can no longer be executed, listed, or suggested, regardless of
     /// which internal dispatcher it lives on.
     pub fn disable_command(&mut self, name: impl Into<String>) {
+        self.parse_cache.clear();
         let name = name.into();
         self.disabled.insert(Self::normalize_command_name(&name));
     }
 
     /// Makes a plugin command unavailable until it is registered again.
     fn deactivate_plugin_command(&mut self, name: impl AsRef<str>) {
+        self.parse_cache.clear();
         self.inactive_plugin_commands
             .insert(Self::normalize_command_name(name.as_ref()));
     }
@@ -190,6 +197,7 @@ impl<S: CommandSource> CommandDispatcher<S> {
     }
 
     fn reactivate_plugin_command(&mut self, name: &str) {
+        self.parse_cache.clear();
         let name = Self::normalize_command_name(name);
         let base_name = name.trim_start_matches('/');
         self.inactive_plugin_commands.remove(&name);
@@ -259,11 +267,16 @@ impl<S: CommandSource> CommandDispatcher<S> {
         input.split_whitespace().next().unwrap_or("")
     }
 
-    fn unknown_command_error(reader: &StringReader<'_>) -> CommandSyntaxError {
+    pub(crate) fn unknown_command_error(reader: &StringReader<'_>) -> CommandSyntaxError {
         DISPATCHER_UNKNOWN_COMMAND.create(
             reader,
             TextComponent::text(Self::command_name(reader.string()).to_owned()),
         )
+    }
+
+    /// Same error as [`Self::unknown_command_error`], for a caller that only kept the input.
+    pub(crate) fn unknown_command_error_for(input: &str) -> CommandSyntaxError {
+        Self::unknown_command_error(&StringReader::new(input))
     }
 
     /// Registers a command which can then be dispatched.
@@ -273,6 +286,7 @@ impl<S: CommandSource> CommandDispatcher<S> {
     /// unregister a command. This is due to redirection to
     /// potentially unregistered (freed) nodes.
     pub fn register(&mut self, command_node: impl Into<CommandDetachedNode<S>>) -> CommandNodeId {
+        self.parse_cache.clear();
         let mut node = command_node.into();
         let name = Self::normalize_command_name(&node.meta.literal);
         node.meta.literal = name.clone().into();
@@ -404,19 +418,46 @@ impl<S: CommandSource> CommandDispatcher<S> {
             };
         }
 
-        let command = parsed.reader.string();
-        let original_context = parsed.context.build(command);
+        let input = parsed.reader.string();
+        let source = parsed.context.source.clone();
+        let compiled = CachedParse::from_builder(parsed.context, Arc::from(input));
+        compiled.execute(&self.tree, &source, self.consumer.as_ref())
+    }
 
-        match ContextChain::try_flatten(&original_context) {
-            None => {
-                self.consumer
-                    .on_command_completion(&original_context, ReturnValue::Failure)?;
-                Err(Self::unknown_command_error(&parsed.reader))
+    /// Parses and runs `input`, reusing an earlier parse of the same line.
+    ///
+    /// `permission_key` must be equal only for sources that parse the same way
+    /// (same permissions). Only fully successful parses are kept, so errors are
+    /// reported exactly like [`Self::execute`].
+    pub fn execute_input_cached(
+        &self,
+        input: &str,
+        source: &S,
+        permission_key: u8,
+    ) -> Result<i32, CommandSyntaxError> {
+        self.execute_input_cached_arc(input, &Arc::new(source.clone()), permission_key)
+    }
+
+    /// Like [`Self::execute_input_cached`], for a caller that already has the
+    /// source shared. Function bodies run thousands of lines per tick and pass
+    /// the same source to every one of them.
+    pub fn execute_input_cached_arc(
+        &self,
+        input: &str,
+        source: &Arc<S>,
+        permission_key: u8,
+    ) -> Result<i32, CommandSyntaxError> {
+        let Some(cached) = self.parse_cache.get(permission_key, input) else {
+            let parsed = self.parse_input(input, source.as_ref());
+            if parsed.reader.peek().is_some() {
+                return self.execute(parsed);
             }
-            Some(flat_context) => {
-                flat_context.execute_all(&original_context.source, self.consumer.as_ref())
-            }
-        }
+            let source_arc = parsed.context.source.clone();
+            let compiled = CachedParse::from_builder(parsed.context, Arc::from(input));
+            let cached = self.parse_cache.insert(permission_key, input, compiled);
+            return cached.execute(&self.tree, &source_arc, self.consumer.as_ref());
+        };
+        cached.execute(&self.tree, source, self.consumer.as_ref())
     }
 
     /// Only parses a given source with the specified source.

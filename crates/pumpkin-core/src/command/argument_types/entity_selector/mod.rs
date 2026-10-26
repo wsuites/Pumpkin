@@ -103,6 +103,14 @@ impl EntitySelector {
         self.find_entities_hinted(source, None)
     }
 
+    /// Whether this selector already requires `tag`, so a tag hint cannot widen the search.
+    #[must_use]
+    pub fn requires_tag(&self, tag: &str) -> bool {
+        self.predicates
+            .iter()
+            .any(|predicate| matches!(predicate, EntitySelectorPredicate::Tag(name, false) if name == tag))
+    }
+
     /// Like [`Self::find_entities`], for a caller that ignores every entity without
     /// `tag` (e.g. `tag @e remove x`). Entities lacking the tag may still be returned,
     /// but the search starts from the tag index instead of every entity in the world.
@@ -200,11 +208,14 @@ impl EntitySelector {
     /// selector, taken from the tag index (`tag=`) or the scoreboard (`scores=`),
     /// whichever is smaller. `None` when neither narrows the search.
     fn candidate_entity_ids(&self, world: &World, tag_hint: Option<&str>) -> Option<Vec<i32>> {
+        // Tags are only counted here; the winning tag's ids are copied out at the end,
+        // so a narrow `scores=` filter never pays for a wide tag's list.
+        let mut best_tag: Option<&str> = None;
         let mut best: Option<Vec<i32>> = None;
         let mut best_len = usize::MAX;
         if let Some(tag) = tag_hint {
             best_len = tag_index::count(tag);
-            best = Some(tag_index::entities_with(tag));
+            best_tag = Some(tag);
         }
         for predicate in &self.predicates {
             if let EntitySelectorPredicate::Tag(tag, false) = predicate
@@ -212,7 +223,7 @@ impl EntitySelector {
             {
                 let len = tag_index::count(tag);
                 if len < best_len {
-                    best = Some(tag_index::entities_with(tag));
+                    best_tag = Some(tag);
                     best_len = len;
                 }
             }
@@ -222,11 +233,32 @@ impl EntitySelector {
                 continue;
             };
             let lookup = world.entity_lookup();
-            let scoreboard = world
+            let mut scoreboard = world
                 .scoreboard
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (objective, bounds) in scores {
+                // An exact value (`scores={id=5}`) is answered by the scoreboard's value
+                // index instead of scanning every holder of the objective.
+                if let (Some(min), Some(max)) = (bounds.min(), bounds.max())
+                    && min == max
+                {
+                    let Some(holders) = scoreboard.holders_with_score(objective, min) else {
+                        return Some(Vec::new());
+                    };
+                    let mut ids: Vec<i32> = holders
+                        .filter_map(|holder| Uuid::try_parse(holder).ok())
+                        .filter_map(|uuid| lookup.get_by_uuid(&uuid))
+                        .map(|entity| entity.get_entity().entity_id)
+                        .collect();
+                    if ids.len() < best_len {
+                        ids.sort_unstable();
+                        best_len = ids.len();
+                        best = Some(ids);
+                        best_tag = None;
+                    }
+                    continue;
+                }
                 // A holder without a score in the objective never matches, so the
                 // objective's matching holders are a complete candidate set.
                 let Some(holders) = scoreboard.get_scores_for_objective(objective) else {
@@ -252,10 +284,11 @@ impl EntitySelector {
                     ids.sort_unstable();
                     best_len = ids.len();
                     best = Some(ids);
+                    best_tag = None;
                 }
             }
         }
-        best
+        best_tag.map(tag_index::entities_with).or(best)
     }
 
     /// Tries to find a single player represented by this selector.

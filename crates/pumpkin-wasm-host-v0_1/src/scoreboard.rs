@@ -284,7 +284,7 @@ impl scoreboard::HostScoreboard for PluginHostState {
                 .scoreboard
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .add_score(world.as_ref(), entity_name, objective_name, delta),
+                .add_score(world.as_ref(), &entity_name, &objective_name, delta),
             ScoreboardProvider::Player(player) => {
                 let mut custom_guard = player
                     .custom_scoreboard
@@ -303,7 +303,7 @@ impl scoreboard::HostScoreboard for PluginHostState {
                 else {
                     return Err(wasmtime::Error::msg("Invalid scoreboard state"));
                 };
-                sb.add_score(player.as_ref(), entity_name, objective_name, delta)
+                sb.add_score(player.as_ref(), &entity_name, &objective_name, delta)
             }
         };
         Ok(new_val)
@@ -1128,7 +1128,7 @@ impl HostBedrockScoreboard for PluginHostState {
         else {
             return Err(wasmtime::Error::msg("Invalid scoreboard state"));
         };
-        let new_val = sb.add_score(player.as_ref(), entity_name, objective_name, delta);
+        let new_val = sb.add_score(player.as_ref(), &entity_name, &objective_name, delta);
         Ok(new_val)
     }
 

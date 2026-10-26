@@ -22,7 +22,7 @@ impl CommandExecutor for MsgExecutor {
         let targets = EntityArgumentType::get_players(context, "targets")?;
         let msg = StringArgumentType::get(context, "message")?;
 
-        let sender_name = &context.source.display_name;
+        let sender_name = &context.source.display_name();
         let msg_text = TextComponent::text(msg.to_string());
 
         if let Some(player) = context.source.player_or_none() {

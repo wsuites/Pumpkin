@@ -1,6 +1,7 @@
 pub mod attached;
 pub mod detached;
 pub mod dispatcher;
+pub mod parse_cache;
 pub mod tree;
 
 use crate::argument_types::argument_type::AnyArgumentType;

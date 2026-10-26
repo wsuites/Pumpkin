@@ -5309,7 +5309,22 @@ impl World {
 
     pub fn remove_entity(&self, entity: &dyn EntityBase) {
         // Entity::remove passes its base projection; retain the registered living owner.
-        let registered = self.get_entity_by_id(entity.get_entity().entity_id);
+        // A linear scan of the list is cheaper than rebuilding the id lookup, which
+        // every removal invalidates (datapacks kill many entities per tick).
+        let id = entity.get_entity().entity_id;
+        let registered = self
+            .entities
+            .load()
+            .iter()
+            .find(|e| e.get_entity().entity_id == id)
+            .cloned()
+            .or_else(|| {
+                self.players
+                    .load()
+                    .iter()
+                    .find(|p| p.get_entity().entity_id == id)
+                    .map(|p| p.clone() as Arc<dyn EntityBase>)
+            });
         let entity = registered.as_deref().unwrap_or(entity);
         let base_entity = entity.get_entity();
         if base_entity
@@ -5330,6 +5345,12 @@ impl World {
         });
         if let Some(mob) = entity.get_mob() {
             mob.get_mob_entity().finish_removal(mob);
+        }
+        if entity.get_player().is_none() {
+            self.scoreboard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entity_removed(self, &base_entity.entity_uuid.to_string());
         }
     }
 

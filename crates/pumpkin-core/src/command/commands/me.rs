@@ -22,7 +22,7 @@ impl CommandExecutor for MeExecutor {
 
         server.broadcast_message(
             &TextComponent::text(msg.to_string()),
-            &context.source.display_name,
+            &context.source.display_name(),
             EMOTE_COMMAND,
             None,
         );

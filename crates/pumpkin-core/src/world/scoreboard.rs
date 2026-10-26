@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use pumpkin_data::scoreboard::ScoreboardDisplaySlot;
 use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
@@ -122,6 +122,10 @@ pub struct Scoreboard {
     display_slots: FxHashMap<ScoreboardDisplaySlot, String>,
     scores: FxHashMap<String, FxHashMap<String, ScoreboardScore>>,
     teams: FxHashMap<String, Team>,
+    /// Holders by score value, kept only for objectives that selectors have asked about
+    /// with an exact `scores={obj=N}` (e.g. a vehicle id), so the selector finds the few
+    /// matching holders without scanning every score in the objective.
+    value_index: FxHashMap<String, FxHashMap<i32, FxHashSet<String>>>,
 }
 
 impl Scoreboard {
@@ -168,6 +172,50 @@ impl Scoreboard {
     pub fn get_score_value(&self, entity_name: &str, objective_name: &str) -> Option<i32> {
         self.get_score(entity_name, objective_name)
             .map(|s| s.value.0)
+    }
+
+    #[must_use]
+    /// The holders whose score in `objective_name` is exactly `value`, or `None` when
+    /// the objective does not exist. Builds the objective's value index on first use.
+    pub fn holders_with_score(
+        &mut self,
+        objective_name: &str,
+        value: i32,
+    ) -> Option<impl Iterator<Item = &String>> {
+        let scores = self.scores.get(objective_name)?;
+        let index = self
+            .value_index
+            .entry(objective_name.to_string())
+            .or_insert_with(|| {
+                let mut index: FxHashMap<i32, FxHashSet<String>> = FxHashMap::default();
+                for (holder, score) in scores {
+                    index
+                        .entry(score.value.0)
+                        .or_default()
+                        .insert(holder.clone());
+                }
+                index
+            });
+        Some(index.get(&value).into_iter().flatten())
+    }
+
+    fn unindex_score(&mut self, objective_name: &str, holder: &str) {
+        let Some(index) = self.value_index.get_mut(objective_name) else {
+            return;
+        };
+        let Some(old) = self
+            .scores
+            .get(objective_name)
+            .and_then(|scores| scores.get(holder))
+        else {
+            return;
+        };
+        if let Some(holders) = index.get_mut(&old.value.0) {
+            holders.remove(holder);
+            if holders.is_empty() {
+                index.remove(&old.value.0);
+            }
+        }
     }
 
     #[must_use]
@@ -362,6 +410,7 @@ impl Scoreboard {
 
         self.objectives.remove(name);
         self.scores.remove(name);
+        self.value_index.remove(name);
         self.display_slots.retain(|_, obj| obj != name);
     }
 
@@ -381,6 +430,15 @@ impl Scoreboard {
             Self::send_score(target, &score);
         }
 
+        if !self.value_index.is_empty() && self.value_index.contains_key(&score.objective_name) {
+            self.unindex_score(&score.objective_name, &score.entity_name);
+            if let Some(index) = self.value_index.get_mut(&score.objective_name) {
+                index
+                    .entry(score.value.0)
+                    .or_default()
+                    .insert(score.entity_name.clone());
+            }
+        }
         self.scores
             .entry(score.objective_name.clone())
             .or_default()
@@ -422,36 +480,105 @@ impl Scoreboard {
     pub fn set_score_value(
         &mut self,
         target: &impl ScoreboardTarget,
-        entity_name: impl Into<String>,
-        objective_name: impl Into<String>,
+        entity_name: &str,
+        objective_name: &str,
         value: i32,
     ) {
-        let entity_s = entity_name.into();
-        let obj_s = objective_name.into();
-        let existing = self.get_score(&entity_s, &obj_s).cloned();
+        if !self.objectives.contains_key(objective_name) {
+            warn!(
+                "Tried to place a score into an objective which does not exist: {objective_name}"
+            );
+            return;
+        }
+        let displayed = self.is_displayed(objective_name);
+
+        // Datapacks set the same scores every tick, and the holder and objective
+        // are already in the maps, so update the entry instead of cloning both
+        // names into a new `ScoreboardScore`.
+        let old_value = {
+            let Some(score) = self
+                .scores
+                .get_mut(objective_name)
+                .and_then(|scores| scores.get_mut(entity_name))
+            else {
+                return self.insert_score(target, entity_name, objective_name, value);
+            };
+            if score.value.0 == value {
+                return;
+            }
+            let old = score.value.0;
+            score.value = VarInt(value);
+            if displayed {
+                Self::send_score(target, score);
+            }
+            old
+        };
+
+        if self.value_index.contains_key(objective_name) {
+            self.reindex_score(objective_name, entity_name, old_value, value);
+        }
+    }
+
+    /// Adds a score for a holder that has none in the objective yet.
+    fn insert_score(
+        &mut self,
+        target: &impl ScoreboardTarget,
+        entity_name: &str,
+        objective_name: &str,
+        value: i32,
+    ) {
+        let entity_s = entity_name.to_owned();
+        let objective_s = objective_name.to_owned();
+        let (display_name, number_format, locked) = self
+            .scores
+            .get(objective_name)
+            .and_then(|scores| scores.get(entity_name))
+            .map_or((None, None, true), |score| {
+                (
+                    score.display_name.clone(),
+                    score.number_format.clone(),
+                    score.locked,
+                )
+            });
         let score = ScoreboardScore {
             entity_name: entity_s,
-            objective_name: obj_s,
+            objective_name: objective_s,
             value: VarInt(value),
-            display_name: existing.as_ref().and_then(|s| s.display_name.clone()),
-            number_format: existing.as_ref().and_then(|s| s.number_format.clone()),
-            locked: existing.as_ref().is_none_or(|s| s.locked),
+            display_name,
+            number_format,
+            locked,
         };
+        // `update_score` keeps the normal path for a new entry: it warns about a
+        // missing objective, sends the score when displayed and indexes the value.
         self.update_score(target, score);
+    }
+
+    /// Moves a holder between values in the objective's value index.
+    fn reindex_score(&mut self, objective_name: &str, holder: &str, old: i32, new: i32) {
+        let Some(index) = self.value_index.get_mut(objective_name) else {
+            return;
+        };
+        if let Some(holders) = index.get_mut(&old) {
+            holders.remove(holder);
+            if holders.is_empty() {
+                index.remove(&old);
+            }
+        }
+        index.entry(new).or_default().insert(holder.to_owned());
     }
 
     pub fn add_score(
         &mut self,
         target: &impl ScoreboardTarget,
-        entity_name: impl Into<String>,
-        objective_name: impl Into<String>,
+        entity_name: &str,
+        objective_name: &str,
         delta: i32,
     ) -> i32 {
-        let entity_s = entity_name.into();
-        let obj_s = objective_name.into();
-        let current_val = self.get_score_value(&entity_s, &obj_s).unwrap_or(0);
+        let current_val = self
+            .get_score_value(entity_name, objective_name)
+            .unwrap_or(0);
         let new_val = current_val.wrapping_add(delta);
-        self.set_score_value(target, entity_s, obj_s, new_val);
+        self.set_score_value(target, entity_name, objective_name, new_val);
         new_val
     }
 
@@ -461,6 +588,7 @@ impl Scoreboard {
         entity_name: &str,
         objective_name: &str,
     ) {
+        self.unindex_score(objective_name, entity_name);
         if !self.is_displayed(objective_name) {
             if let Some(objective_scores) = self.scores.get_mut(objective_name) {
                 objective_scores.remove(entity_name);
@@ -488,6 +616,18 @@ impl Scoreboard {
         }
     }
 
+    /// Like vanilla `Scoreboard.entityRemoved`: drops a removed entity's scores, but only
+    /// sends packets when it actually had any, since most removed entities have none.
+    pub fn entity_removed(&mut self, target: &impl ScoreboardTarget, entity_name: &str) {
+        if self
+            .scores
+            .values()
+            .any(|scores| scores.contains_key(entity_name))
+        {
+            self.reset_scores_for_entity(target, entity_name);
+        }
+    }
+
     pub fn reset_scores_for_entity(&mut self, target: &impl ScoreboardTarget, entity_name: &str) {
         let je_packet = CResetScore::new(entity_name.to_string(), None);
 
@@ -512,6 +652,10 @@ impl Scoreboard {
 
         target.send_editioned(&je_packet, &be_packet);
 
+        let indexed: Vec<String> = self.value_index.keys().cloned().collect();
+        for objective in indexed {
+            self.unindex_score(&objective, entity_name);
+        }
         for obj_scores in self.scores.values_mut() {
             obj_scores.remove(entity_name);
         }
@@ -864,6 +1008,7 @@ impl Scoreboard {
     pub fn load_saved_nbt(&mut self, data: &NbtCompound) {
         self.objectives.clear();
         self.scores.clear();
+        self.value_index.clear();
         self.display_slots.clear();
 
         for tag in data.get_list("Objectives").unwrap_or_default() {

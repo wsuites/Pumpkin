@@ -307,7 +307,7 @@ impl ResourceArgument {
             .get(name)
             .ok_or(missing_argument)?
             .range
-            .substring_slice(context.input.as_str())
+            .substring_slice(&context.input)
             .to_string();
         let err = ERROR_INVALID_RESOURCE_TYPE.create_without_context(
             TextComponent::text(identifier),

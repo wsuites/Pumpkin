@@ -53,8 +53,9 @@ pub struct CommandSource {
     pub entity: Option<Arc<dyn EntityBase>>,
     pub position: Vector3<f64>,
     pub rotation: Vector2<f32>,
-    pub name: String,
-    pub display_name: TextComponent,
+    /// Fixed name and display name; `None` derives both from `entity` on demand,
+    /// so forking a source per entity (`execute as`) doesn't build text it rarely reads.
+    names: Option<Arc<(String, TextComponent)>>,
     pub server: Option<Arc<Server>>,
     pub silent: bool,
     pub command_result_taker: ResultValueTaker,
@@ -62,6 +63,34 @@ pub struct CommandSource {
 }
 
 impl CommandSource {
+    /// The source's name, e.g. the name a `@s` score or a ban is recorded under.
+    #[must_use]
+    pub fn name(&self) -> String {
+        match (&self.names, &self.entity) {
+            (Some(names), _) => names.0.clone(),
+            (None, Some(entity)) => entity.get_name().get_text(),
+            (None, None) => String::new(),
+        }
+    }
+
+    /// The source's display name, as shown in `say`, `me` and `msg`.
+    #[must_use]
+    pub fn display_name(&self) -> TextComponent {
+        match (&self.names, &self.entity) {
+            (Some(names), _) => names.1.clone(),
+            (None, Some(entity)) => entity.get_display_name(),
+            (None, None) => TextComponent::empty(),
+        }
+    }
+
+    /// Makes the name and display name follow `entity`, like vanilla `withEntity`.
+    #[must_use]
+    pub fn with_entity_names(mut self, entity: Arc<dyn EntityBase>) -> Self {
+        self.entity = Some(entity);
+        self.names = None;
+        self
+    }
+
     /// Creates a dummy [`CommandSource`], great for unit testing.
     ///
     /// # Note
@@ -80,8 +109,7 @@ impl CommandSource {
             entity: None,
             position: Vector3::default(),
             rotation: Vector2::default(),
-            name: String::new(),
-            display_name: TextComponent::empty(),
+            names: None,
             server: None,
             silent: false,
             command_result_taker: ResultValueTaker::new(),
@@ -107,8 +135,7 @@ impl CommandSource {
             entity,
             position,
             rotation,
-            name,
-            display_name,
+            names: Some(Arc::new((name, display_name))),
             server: Some(server),
             silent: false,
             command_result_taker: ResultValueTaker(Vec::new()),
@@ -126,8 +153,7 @@ impl CommandSource {
             entity: self.entity,
             position: self.position,
             rotation: self.rotation,
-            name: self.name,
-            display_name: self.display_name,
+            names: self.names,
             server: self.server,
             silent: self.silent,
             command_result_taker: self.command_result_taker,
@@ -145,8 +171,7 @@ impl CommandSource {
             entity: self.entity,
             position: self.position,
             rotation: self.rotation,
-            name: self.name,
-            display_name: self.display_name,
+            names: self.names,
             server: self.server,
             silent: true,
             command_result_taker: self.command_result_taker,
@@ -158,16 +183,13 @@ impl CommandSource {
     /// everything else from the `source` provided.
     #[must_use]
     pub fn with_entity(self, entity: Arc<dyn EntityBase>) -> Self {
-        let name = entity.get_name().get_text();
-        let display_name = entity.get_display_name();
         Self {
             output: self.output,
             world: self.world,
             entity: Some(entity),
             position: self.position,
             rotation: self.rotation,
-            name,
-            display_name,
+            names: None,
             server: self.server,
             silent: self.silent,
             command_result_taker: self.command_result_taker,
@@ -185,8 +207,7 @@ impl CommandSource {
             entity: self.entity,
             position,
             rotation: self.rotation,
-            name: self.name,
-            display_name: self.display_name,
+            names: self.names,
             server: self.server,
             silent: self.silent,
             command_result_taker: self.command_result_taker,
@@ -204,8 +225,7 @@ impl CommandSource {
             entity: self.entity,
             position: self.position,
             rotation,
-            name: self.name,
-            display_name: self.display_name,
+            names: self.names,
             server: self.server,
             silent: self.silent,
             command_result_taker: self.command_result_taker,
@@ -231,8 +251,7 @@ impl CommandSource {
             entity: self.entity,
             position: self.position,
             rotation: self.rotation,
-            name: self.name,
-            display_name: self.display_name,
+            names: self.names,
             server: self.server,
             silent: true,
             command_result_taker: self.command_result_taker,
@@ -250,8 +269,7 @@ impl CommandSource {
             entity: self.entity,
             position: self.position,
             rotation: self.rotation,
-            name: self.name,
-            display_name: self.display_name,
+            names: self.names,
             server: self.server,
             silent: self.silent,
             command_result_taker,
@@ -269,8 +287,7 @@ impl CommandSource {
             entity: self.entity,
             position: self.position,
             rotation: self.rotation,
-            name: self.name,
-            display_name: self.display_name,
+            names: self.names,
             server: self.server,
             silent: true,
             command_result_taker: self.command_result_taker,
@@ -376,7 +393,7 @@ impl CommandSource {
         let text = TextComponent::translate_cross(
             "chat.type.admin",
             "chat.type.admin",
-            &[self.display_name.clone(), message],
+            &[self.display_name(), message],
         )
         .color(Color::Named(NamedColor::Gray))
         .italic();
@@ -399,6 +416,22 @@ impl CommandSource {
     }
 
     /// Sends feedback to this source.
+    /// Like [`Self::send_feedback`], but only builds the message when someone will see it.
+    /// Functions run silently, so datapacks calling a command thousands of times a tick
+    /// skip formatting a message that would be thrown away.
+    pub fn send_feedback_with(
+        &self,
+        message: impl FnOnce() -> TextComponent,
+        broadcast_to_ops: bool,
+    ) {
+        if !self.silent
+            && (self.output.should_receive_feedback()
+                || (broadcast_to_ops && self.output.should_broadcast_console_to_ops()))
+        {
+            self.send_feedback(message(), broadcast_to_ops);
+        }
+    }
+
     pub fn send_feedback(&self, message: TextComponent, broadcast_to_ops: bool) {
         if !self.silent {
             let should_send_to_output = self.output.should_receive_feedback();

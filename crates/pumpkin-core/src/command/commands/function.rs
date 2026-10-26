@@ -116,7 +116,7 @@ impl CommandExecutor for FunctionExecutor {
         let server = context.server();
         let arguments = self.arguments(context)?;
 
-        let result = match server.datapack_manager.execute_function_with(
+        let result = match server.datapack_manager.execute_function_with_source(
             server,
             &context.source,
             name_str,
@@ -146,31 +146,24 @@ impl CommandExecutor for FunctionExecutor {
         let executed_count = result.executed;
         pumpkin_command::context::command_context::skip_result_callbacks();
 
-        if name_str.starts_with('#') {
-            context.source.send_feedback(
+        context.source.send_feedback_with(
+            || {
+                let key = if name_str.starts_with('#') {
+                    translation::java::COMMANDS_FUNCTION_SUCCESS_MULTIPLE
+                } else {
+                    translation::java::COMMANDS_FUNCTION_SUCCESS_SINGLE
+                };
                 TextComponent::translate_cross(
-                    translation::java::COMMANDS_FUNCTION_SUCCESS_MULTIPLE,
-                    translation::java::COMMANDS_FUNCTION_SUCCESS_MULTIPLE,
+                    key,
+                    key,
                     [
                         TextComponent::text(executed_count.to_string()),
                         TextComponent::text(name_str.to_string()),
                     ],
-                ),
-                true,
-            );
-        } else {
-            context.source.send_feedback(
-                TextComponent::translate_cross(
-                    translation::java::COMMANDS_FUNCTION_SUCCESS_SINGLE,
-                    translation::java::COMMANDS_FUNCTION_SUCCESS_SINGLE,
-                    [
-                        TextComponent::text(executed_count.to_string()),
-                        TextComponent::text(name_str.to_string()),
-                    ],
-                ),
-                true,
-            );
-        }
+                )
+            },
+            true,
+        );
 
         Ok(executed_count as i32)
     }

@@ -70,7 +70,7 @@ pub enum OwnedArg {
 #[must_use]
 pub fn build_consumed_args_from_context(context: &CommandContext) -> HashMap<String, OwnedArg> {
     let mut map = HashMap::new();
-    for (name, parsed) in &context.arguments {
+    for (name, parsed) in context.arguments.iter() {
         let res = &parsed.result;
         if let Some(&b) = res.downcast_ref::<bool>() {
             map.insert(name.clone(), OwnedArg::Bool(b));

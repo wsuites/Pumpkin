@@ -42,7 +42,7 @@ fn ban_profile(context: &CommandContext, profile: &GameProfile, reason: Option<S
 
     banned_players.banned_players.push(BannedPlayerEntry::new(
         profile,
-        context.source.name.clone(),
+        context.source.name(),
         None,
         reason.clone(),
     ));

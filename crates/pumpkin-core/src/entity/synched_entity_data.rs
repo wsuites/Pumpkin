@@ -139,6 +139,26 @@ impl SynchedEntityData {
         true
     }
 
+    /// Like [`Self::set`], but sends the value even when it did not change, like
+    /// vanilla `SynchedEntityData.set(key, value, true)`.
+    pub fn set_forced<T: MetadataSerializer + Clone + Send + Sync + 'static>(
+        &self,
+        tracked: TrackedData,
+        value: T,
+    ) {
+        if !self.set(tracked, value) {
+            let mut items = self
+                .items
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(item) = items.get_mut(&tracked) {
+                item.dirty = true;
+            }
+            drop(items);
+            self.is_dirty.store(true, Ordering::Release);
+        }
+    }
+
     /// Whether any value changed since the last [`Self::clear_dirty`].
     #[must_use]
     pub fn is_dirty(&self) -> bool {

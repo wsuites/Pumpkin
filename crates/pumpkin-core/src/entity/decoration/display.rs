@@ -97,7 +97,8 @@ impl DisplayEntity {
     pub fn set_interpolation_start_delta_ticks(&self, ticks: i32) {
         self.interpolation_start_delta_ticks
             .store(ticks, Ordering::Relaxed);
-        self.entity.set_synced_data(
+        // Vanilla forces this one so the client restarts the interpolation every time.
+        self.entity.set_synced_data_forced(
             pumpkin_data::tracked_data::display::START_INTERPOLATION,
             VarInt(ticks),
         );
@@ -558,8 +559,7 @@ impl DisplayEntity {
             self.interpolation_duration.store(dur, Ordering::Relaxed);
         }
         if let Some(start) = nbt.get_int("start_interpolation") {
-            self.interpolation_start_delta_ticks
-                .store(start, Ordering::Relaxed);
+            self.set_interpolation_start_delta_ticks(start);
         }
         if let Some(vr) = nbt.get_float("view_range") {
             *self
@@ -813,7 +813,12 @@ impl EntityBase for BlockDisplayEntity {
 
 pub struct ItemDisplayEntity {
     pub display: DisplayEntity,
-    pub item_stack: Mutex<ItemStack>,
+    item_stack: Mutex<ItemStack>,
+    /// `{item: ...}` as saved, built on first read and dropped whenever the item
+    /// changes. Datapacks read data out of a display's item many times a tick (e.g.
+    /// `data get entity @s item.components."minecraft:custom_data"`), and saving the
+    /// whole stack each time costs far more than the read itself.
+    item_root_nbt: Mutex<Option<Arc<NbtTag>>>,
     pub item_display: AtomicU8,
 }
 
@@ -822,6 +827,7 @@ impl ItemDisplayEntity {
         Arc::new(Self {
             display: DisplayEntity::new(entity),
             item_stack: Mutex::new(ItemStack::new(0, &pumpkin_data::item::Item::AIR)),
+            item_root_nbt: Mutex::new(None),
             item_display: AtomicU8::new(0),
         })
     }
@@ -838,10 +844,43 @@ impl ItemDisplayEntity {
             .item_stack
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = item.clone();
+        self.invalidate_item_nbt();
         self.display.entity.set_synced_data(
             pumpkin_data::tracked_data::item_display::ITEM,
             ItemStackSerializer::from(item),
         );
+    }
+
+    fn invalidate_item_nbt(&self) {
+        *self
+            .item_root_nbt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// The saved `{item: ...}` compound, from the cache when the item hasn't changed.
+    fn item_root_nbt(&self) -> Arc<NbtTag> {
+        let mut cached = self
+            .item_root_nbt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(root) = cached.as_ref() {
+            return root.clone();
+        }
+        let mut nbt = NbtCompound::new();
+        let item = self
+            .item_stack
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !item.is_empty() {
+            let mut item_compound = NbtCompound::new();
+            item.write_item_stack(&mut item_compound);
+            nbt.put_compound("item", item_compound);
+        }
+        drop(item);
+        let root = Arc::new(NbtTag::Compound(nbt));
+        *cached = Some(root.clone());
+        root
     }
 
     pub fn get_item_display_mode(&self) -> u8 {
@@ -857,6 +896,19 @@ impl ItemDisplayEntity {
 }
 
 impl EntityBase for ItemDisplayEntity {
+    fn read_root_nbt(&self, key: &str, f: &mut dyn FnMut(&NbtTag)) -> bool {
+        if key != "item" {
+            let mut nbt = NbtCompound::new();
+            if !self.display.entity.write_movement_nbt(key, &mut nbt) {
+                return false;
+            }
+            f(&NbtTag::Compound(nbt));
+            return true;
+        }
+        f(&self.item_root_nbt());
+        true
+    }
+
     fn write_custom_nbt(&self, nbt: &mut NbtCompound) {
         self.display.write_display_nbt(nbt);
         let display_mode_str = match self.item_display.load(Ordering::Relaxed) {
@@ -871,14 +923,10 @@ impl EntityBase for ItemDisplayEntity {
             _ => "none",
         };
         nbt.put_string("item_display", display_mode_str.to_string());
-        let item = self
-            .item_stack
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !item.is_empty() {
-            let mut item_compound = NbtCompound::new();
-            item.write_item_stack(&mut item_compound);
-            nbt.put_compound("item", item_compound);
+        if let NbtTag::Compound(root) = self.item_root_nbt().as_ref()
+            && let Some(item) = root.get_compound("item")
+        {
+            nbt.put_compound("item", item.clone());
         }
     }
 
@@ -891,6 +939,7 @@ impl EntityBase for ItemDisplayEntity {
                 .item_stack
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = stack;
+            self.invalidate_item_nbt();
         }
         if let Some(mode_str) = nbt.get_string("item_display") {
             let mode = match mode_str {

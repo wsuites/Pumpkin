@@ -242,7 +242,7 @@ impl CommandExecutor for TeamJoinExecutor {
                 .map(|e| e.get_scoreboard_name())
                 .collect::<Vec<_>>()
         } else {
-            let sender_name = context.source.name.clone();
+            let sender_name = context.source.name();
             vec![sender_name]
         };
 
@@ -309,7 +309,7 @@ impl CommandExecutor for TeamLeaveExecutor {
                 .map(|e| e.get_scoreboard_name())
                 .collect::<Vec<_>>()
         } else {
-            let sender_name = context.source.name.clone();
+            let sender_name = context.source.name();
             vec![sender_name]
         };
 

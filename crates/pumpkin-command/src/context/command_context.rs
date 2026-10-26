@@ -2,21 +2,14 @@ use crate::context::string_range::StringRange;
 use crate::errors::command_syntax_error::CommandSyntaxError;
 use crate::errors::error_types::DISPATCHER_PARSE_EXCEPTION;
 use crate::node::attached::NodeId;
-use crate::node::dispatcher::{CommandDispatcher, EmptyResultConsumer, ResultConsumer};
+use crate::node::dispatcher::CommandDispatcher;
 use crate::node::tree::Tree;
 use crate::node::{Command, RedirectModifier};
-use crate::source::{CommandSource, DummySource, ReturnValue};
+use crate::source::{CommandSource, DummySource};
 use pumpkin_util::text::TextComponent;
 use rustc_hash::FxHashMap;
 use std::any::Any;
 use std::sync::Arc;
-
-/// Represents the current stage of the chain.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum Stage {
-    MODIFY,
-    EXECUTE,
-}
 
 /// Represents a parsed node.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -56,11 +49,14 @@ pub struct CommandContext<'a, S: CommandSource = DummySource> {
     pub source: Arc<S>,
 
     /// The input string ran as the command.
-    pub input: String,
+    /// Shared, so rebuilding or forking a context does not copy the line.
+    pub input: Arc<str>,
 
     /// Arguments which have been parsed and
     /// can be fetched for command execution.
-    pub arguments: FxHashMap<String, Arc<ParsedArgument>>,
+    /// Shared, so forking a context per entity (`execute as`) or rebuilding a
+    /// cached parse does not copy the map and its keys.
+    pub arguments: Arc<FxHashMap<String, Arc<ParsedArgument>>>,
 
     /// The tree this context is related to.
     pub tree: &'a Tree<S>,
@@ -70,7 +66,8 @@ pub struct CommandContext<'a, S: CommandSource = DummySource> {
     pub root: NodeId,
 
     /// All the parsed nodes of the command.
-    pub nodes: Vec<ParsedNode>,
+    /// Shared, so rebuilding or forking a context does not copy the list.
+    pub nodes: Arc<[ParsedNode]>,
 
     /// The string range of input.
     pub range: StringRange,
@@ -178,199 +175,6 @@ impl<S: CommandSource> CommandContext<'_, S> {
     }
 }
 
-/// Represents a linked chain of [`CommandContext`]s, where the previous links to the next as a child.
-#[derive(Clone)]
-pub struct ContextChain<'a, S: CommandSource = DummySource> {
-    /// The modifiers of this context chain.
-    modifiers: Vec<Arc<CommandContext<'a, S>>>,
-
-    /// That specific [`CommandContext`] to execute.
-    execute: Arc<CommandContext<'a, S>>,
-}
-
-impl<'a, S: CommandSource> ContextChain<'a, S> {
-    /// Creates a new chain of contexts from a vector of them and one to execute.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `execute` given is non-executable.
-    #[must_use]
-    pub fn new(
-        modifiers: Vec<Arc<CommandContext<'a, S>>>,
-        execute: Arc<CommandContext<'a, S>>,
-    ) -> Self {
-        assert!(
-            execute.command.is_some(),
-            "Expected last command in chain to be executable"
-        );
-        Self { modifiers, execute }
-    }
-
-    /// Tries to flatten a [`CommandContext`]. If no command
-    /// is available at the end of chain, [`None`] is returned.
-    #[must_use]
-    pub fn try_flatten(root: &CommandContext<'a, S>) -> Option<Self> {
-        let mut modifiers = Vec::new();
-        let mut current = Arc::new(root.clone());
-        loop {
-            if let Some(child) = current.get_child() {
-                let temp_child = child.clone();
-                modifiers.push(current);
-                current = temp_child;
-            } else {
-                return current
-                    .command
-                    .is_some()
-                    .then(|| Self::new(modifiers, current));
-            }
-        }
-    }
-
-    /// Runs the given modifier with provided details.
-    pub fn run_modifier(
-        modifier: &CommandContext<'a, S>,
-        source: &Arc<S>,
-        result_consumer: &dyn ResultConsumer<S>,
-        forked_mode: bool,
-    ) -> Result<Vec<Arc<S>>, CommandSyntaxError> {
-        let source_modifier = &modifier.modifier;
-
-        if matches!(source_modifier, RedirectModifier::KeepSource) {
-            return Ok(vec![source.clone()]);
-        }
-
-        let context_to_use = modifier.with_source(source.clone());
-        let mut result = source_modifier.sources(&context_to_use);
-
-        if result.is_err() {
-            result_consumer.on_command_completion(&context_to_use, ReturnValue::Failure)?;
-            if forked_mode {
-                result = Ok(vec![]);
-            }
-        }
-
-        result
-    }
-
-    /// Runs the given executable, returning an [`i32`] on success.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `executable` provided cannot be executed.
-    pub fn run_executable(
-        executable: &CommandContext<'a, S>,
-        source: &Arc<S>,
-        result_consumer: &dyn ResultConsumer<S>,
-        forked_mode: bool,
-    ) -> Result<i32, CommandSyntaxError> {
-        let context_to_use = executable.with_source(source.clone());
-
-        let mut result = executable.command.as_ref().map_or_else(
-            || panic!("Expected `executable` to be executable"),
-            |command| command.execute(&context_to_use),
-        );
-
-        if let Ok(result) = result {
-            // Vanilla's `function` only reports a result when the function used `return`.
-            if !SKIP_RESULT.with(|skip| skip.replace(false)) {
-                result_consumer
-                    .on_command_completion(&context_to_use, ReturnValue::Success(result))?;
-            }
-            Ok(if forked_mode { 1 } else { result })
-        } else {
-            result_consumer.on_command_completion(&context_to_use, ReturnValue::Failure)?;
-            if forked_mode {
-                result = Ok(0);
-            }
-            result
-        }
-    }
-
-    /// Executes all contexts in the chain, returning the ultimate result.
-    pub fn execute_all(
-        &self,
-        source: &Arc<S>,
-        result_consumer: &dyn ResultConsumer<S>,
-    ) -> Result<i32, CommandSyntaxError> {
-        if self.modifiers.is_empty() {
-            return Self::run_executable(&self.execute, source, result_consumer, false);
-        }
-
-        let mut forked_mode = false;
-        let mut current_sources: Vec<Arc<S>> = vec![source.clone()];
-
-        for modifier in &self.modifiers {
-            forked_mode |= modifier.forks;
-
-            let mut next_sources = Vec::new();
-            for source in current_sources {
-                // Vanilla's BuildContexts only reports results for executed commands.
-                let mut to_add =
-                    Self::run_modifier(modifier, &source, &EmptyResultConsumer, forked_mode)?;
-                next_sources.append(&mut to_add);
-            }
-            if next_sources.is_empty() {
-                return Ok(0);
-            }
-            current_sources = next_sources;
-        }
-
-        let mut result = 0;
-        for execution_source in current_sources {
-            result += Self::run_executable(
-                &self.execute,
-                &execution_source,
-                result_consumer,
-                forked_mode,
-            )?;
-        }
-
-        Ok(result)
-    }
-
-    /// Gets the current stage of this context.
-    #[must_use]
-    pub const fn get_stage(&self) -> Stage {
-        if self.modifiers.is_empty() {
-            Stage::EXECUTE
-        } else {
-            Stage::MODIFY
-        }
-    }
-
-    /// Gets a reference to the top context of this chain.
-    #[must_use]
-    pub fn get_top_context(&'_ self) -> &'_ Arc<CommandContext<'a, S>> {
-        if self.modifiers.is_empty() {
-            &self.execute
-        } else {
-            &self.modifiers[0]
-        }
-    }
-
-    /// Gets a mutable reference to the top context of this chain.
-    pub fn get_top_context_mut(&'_ mut self) -> &mut Arc<CommandContext<'a, S>> {
-        if self.modifiers.is_empty() {
-            &mut self.execute
-        } else {
-            &mut self.modifiers[0]
-        }
-    }
-
-    /// Gets the next stage of this chain.
-    #[must_use]
-    pub fn next_stage(&self) -> Option<Self> {
-        if self.modifiers.is_empty() {
-            None
-        } else {
-            Some(Self::new(
-                self.modifiers[1..].to_vec(),
-                self.execute.clone(),
-            ))
-        }
-    }
-}
-
 /// A builder that helps to create a [`CommandContext`].
 ///
 /// This builder's lifetime is bound to the dispatcher provided to it.
@@ -440,11 +244,11 @@ impl<'a, S: CommandSource> CommandContextBuilder<'a, S> {
     pub fn build(self, input: &str) -> CommandContext<'a, S> {
         CommandContext {
             source: self.source,
-            input: input.to_string(),
-            arguments: self.arguments,
+            input: Arc::from(input),
+            arguments: Arc::new(self.arguments),
             tree: &self.dispatcher.tree,
             root: self.root,
-            nodes: self.nodes,
+            nodes: self.nodes.into(),
             range: self.range,
             child: self.child.map(|child| Arc::new(child.build(input))),
             modifier: self.modifier,
@@ -541,12 +345,10 @@ impl<'a, S: CommandSource> CommandContextBuilder<'a, S> {
 #[cfg(test)]
 mod test {
     use crate::argument_builder::{ArgumentBuilder, CommandArgumentBuilder};
-    use crate::context::command_context::{
-        CommandContext, CommandContextBuilder, ContextChain, ParsedArgument, Stage,
-    };
+    use crate::context::command_context::{CommandContext, CommandContextBuilder, ParsedArgument};
     use crate::context::string_range::StringRange;
     use crate::errors::command_syntax_error::CommandSyntaxError;
-    use crate::node::dispatcher::{CommandDispatcher, EmptyResultConsumer};
+    use crate::node::dispatcher::CommandDispatcher;
     use crate::node::tree::ROOT_NODE_ID;
     use crate::node::{CommandExecutor, CommandExecutorResult, RedirectModifier, Redirection};
     use crate::source::DummySource;
@@ -608,12 +410,7 @@ mod test {
             .register(CommandArgumentBuilder::new("foo", "A test command").executes(TenExecutor));
 
         let source = Arc::new(DummySource::dummy());
-        let result = dispatcher.parse_input("foo", &source);
-        let top_context = result.context.build("foo");
-        let chain = ContextChain::try_flatten(&top_context)
-            .expect("The context should have properly flattened, as it has a command to execute");
-
-        assert_eq!(chain.execute_all(&source, &EmptyResultConsumer), Ok(10));
+        assert_eq!(dispatcher.execute_input("foo", &source), Ok(10));
     }
 
     #[test]
@@ -626,12 +423,7 @@ mod test {
         );
 
         let source = Arc::new(DummySource::dummy());
-        let result = dispatcher.parse_input("bar foo", &source);
-        let top_context = result.context.build("bar foo");
-        let chain = ContextChain::try_flatten(&top_context)
-            .expect("The context should have properly flattened, as it has a command to execute");
-
-        assert_eq!(chain.execute_all(&source, &EmptyResultConsumer), Ok(10));
+        assert_eq!(dispatcher.execute_input("bar foo", &source), Ok(10));
     }
 
     #[test]
@@ -779,13 +571,7 @@ mod test {
             .register(CommandArgumentBuilder::new("foo", "A test command").executes(TenExecutor));
 
         let source = Arc::new(DummySource::dummy());
-        let result = dispatcher.parse_input("foo", &source);
-        let top_context = result.context.build("foo");
-        let chain = ContextChain::try_flatten(&top_context)
-            .expect("The context should have properly flattened, as it has a command to execute");
-
-        assert_eq!(chain.get_stage(), Stage::EXECUTE);
-        assert!(chain.next_stage().is_none());
+        assert_eq!(dispatcher.execute_input("foo", &source), Ok(10));
     }
 
     #[test]
@@ -802,22 +588,7 @@ mod test {
         );
 
         let source = Arc::new(DummySource::dummy());
-        let result = dispatcher.parse_input("bar qux foo", &source);
-        let top_context = result.context.build("bar qux foo");
-        let chain = ContextChain::try_flatten(&top_context)
-            .expect("The context should have properly flattened, as it has a command to execute");
-        assert_eq!(chain.get_stage(), Stage::MODIFY);
-
-        let chain2 = chain
-            .next_stage()
-            .expect("There should have been the next stage");
-        assert_eq!(chain2.get_stage(), Stage::MODIFY);
-
-        let chain3 = chain2
-            .next_stage()
-            .expect("There should have been the next stage");
-        assert_eq!(chain3.get_stage(), Stage::EXECUTE);
-        assert!(chain3.next_stage().is_none());
+        assert_eq!(dispatcher.execute_input("bar qux foo", &source), Ok(10));
     }
 
     #[test]
@@ -826,10 +597,7 @@ mod test {
         dispatcher.register(CommandArgumentBuilder::new("foo", "A test command"));
 
         let source = DummySource::dummy();
-        let result = dispatcher.parse_input("foo", &source);
-        let top_context = result.context.build("foo");
-
-        assert!(ContextChain::try_flatten(&top_context).is_none());
+        assert!(dispatcher.execute_input("foo", &source).is_err());
     }
 
     struct CustomExecutor;
@@ -858,17 +626,7 @@ mod test {
             ),
         );
         let source = Arc::new(DummySource::dummy());
-        let result = dispatcher.parse_input("bar foo", source.as_ref());
-        let top_context = result.context.build("bar foo");
-        let chain = ContextChain::try_flatten(&top_context)
-            .expect("The context should have properly flattened, as it has a command to execute");
-        assert_eq!(chain.get_top_context().source.position, Vector3::default());
-        let chain2 = chain
-            .next_stage()
-            .expect("There should have been the next stage");
-        assert!(chain2.next_stage().is_none());
-        let res = chain.execute_all(&source, dispatcher.consumer.as_ref());
-        assert!(res.is_ok_and(|val| val == 1));
+        assert_eq!(dispatcher.execute_input("bar foo", &source), Ok(1));
     }
 }
 
@@ -880,4 +638,9 @@ thread_local! {
 /// like a vanilla function that finished without `return`.
 pub fn skip_result_callbacks() {
     SKIP_RESULT.with(|skip| skip.set(true));
+}
+
+/// Returns whether the command that just ran suppressed its result, clearing the flag.
+pub(crate) fn take_skip_result() -> bool {
+    SKIP_RESULT.with(|skip| skip.replace(false))
 }

@@ -30,14 +30,14 @@ use crate::command::argument_types::entity::EntityArgumentType;
 use crate::command::argument_types::identifier::IdentifierArgumentType;
 use crate::command::argument_types::nbt::{NbtCompoundArgumentType, NbtTagArgumentType};
 use crate::command::argument_types::nbt_path::{
-    ERROR_DATA_TOO_DEEP, NbtPath, NbtPathArgumentType, is_too_deep,
+    ERROR_DATA_TOO_DEEP, NbtPath, NbtPathArgumentType, NbtPathNode, is_too_deep,
 };
 use crate::command::context::command_context::CommandContext;
 use crate::command::errors::command_syntax_error::CommandSyntaxError;
 use crate::command::errors::error_types::CommandErrorType;
 use crate::command::node::dispatcher::CommandDispatcher;
 use crate::command::node::{CommandExecutor, CommandExecutorResult};
-use crate::entity::EntityBase;
+use crate::entity::{EntityBase, MOVEMENT_NBT_KEYS};
 use crate::server::Server;
 use crate::world::World;
 
@@ -232,6 +232,26 @@ pub trait DataAccessor: Send + Sync {
         }
         Ok(result)
     }
+
+    /// Like `read`, for an `f` that only looks at what `path` selects.
+    fn read_at(
+        &self,
+        path: &NbtPath,
+        f: &mut dyn FnMut(&NbtTag),
+    ) -> Result<(), CommandSyntaxError> {
+        let _ = path;
+        self.read(f)
+    }
+
+    /// Like `modify`, for an `f` that only touches what `path` selects.
+    fn modify_at(
+        &self,
+        path: &NbtPath,
+        f: &mut dyn FnMut(&mut NbtTag) -> Result<i32, CommandSyntaxError>,
+    ) -> Result<i32, CommandSyntaxError> {
+        let _ = path;
+        self.modify(f)
+    }
 }
 
 /// Reads the tags `path` selects from the accessor's data.
@@ -240,8 +260,18 @@ pub fn read_path(
     path: &NbtPath,
 ) -> Result<Vec<NbtTag>, CommandSyntaxError> {
     let mut result = Ok(Vec::new());
-    accessor.read(&mut |root| result = path.get(root))?;
+    accessor.read_at(path, &mut |root| result = path.get(root))?;
     result
+}
+
+/// The movement tag (`Pos`, `Motion` or `Rotation`) that `path` starts in, if any.
+fn movement_root(path: &NbtPath) -> Option<&str> {
+    match path.nodes().first() {
+        Some(NbtPathNode::CompoundChild(key)) if MOVEMENT_NBT_KEYS.contains(&key.as_str()) => {
+            Some(key)
+        }
+        _ => None,
+    }
 }
 
 /// Saves an entity's NBT, adding a player's held item as `SelectedItem`, matching
@@ -284,6 +314,43 @@ impl DataAccessor for EntityDataAccessor {
 
     fn get_data(&self) -> Result<NbtCompound, CommandSyntaxError> {
         Ok(entity_nbt_with_selected_item(self.entity.as_ref()))
+    }
+
+    // Paths inside a single root tag (movement tags, a display's `item`) only need
+    // that tag, so these skip saving and reloading the whole entity. Datapacks read
+    // and move display entities this way many times a tick.
+    fn read_at(
+        &self,
+        path: &NbtPath,
+        f: &mut dyn FnMut(&NbtTag),
+    ) -> Result<(), CommandSyntaxError> {
+        if let Some(NbtPathNode::CompoundChild(key)) = path.nodes().first()
+            && self.entity.read_root_nbt(key, f)
+        {
+            return Ok(());
+        }
+        self.read(f)
+    }
+
+    fn modify_at(
+        &self,
+        path: &NbtPath,
+        f: &mut dyn FnMut(&mut NbtTag) -> Result<i32, CommandSyntaxError>,
+    ) -> Result<i32, CommandSyntaxError> {
+        let Some(key) = movement_root(path) else {
+            return self.modify(f);
+        };
+        let mut nbt = NbtCompound::new();
+        self.entity.get_entity().write_movement_nbt(key, &mut nbt);
+        let mut root = NbtTag::Compound(nbt);
+        let result = f(&mut root)?;
+        if self.entity.get_player().is_some() {
+            return Err(ERROR_ENTITY_INVALID.create_without_context());
+        }
+        if let NbtTag::Compound(data) = root {
+            self.entity.get_entity().read_nbt_non_mut(&data);
+        }
+        Ok(result)
     }
 
     fn get_modified_success(&self) -> TextComponent {
@@ -590,9 +657,10 @@ fn execute_get(
     if !has_path {
         let data = accessor.get_data()?;
         let result = data.child_tags.len() as i32;
-        context
-            .source
-            .send_feedback(accessor.get_print_success(&NbtTag::Compound(data)), false);
+        context.source.send_feedback_with(
+            || accessor.get_print_success(&NbtTag::Compound(data)),
+            false,
+        );
         return Ok(result);
     }
 
@@ -641,7 +709,7 @@ fn execute_get(
     };
     context
         .source
-        .send_feedback(accessor.get_print_success(&tag), false);
+        .send_feedback_with(|| accessor.get_print_success(&tag), false);
     Ok(result)
 }
 
@@ -662,20 +730,20 @@ fn execute_merge(context: &CommandContext, target_kind: TargetKind) -> CommandEx
     accessor.set_data(&updated)?;
     context
         .source
-        .send_feedback(accessor.get_modified_success(), true);
+        .send_feedback_with(|| accessor.get_modified_success(), true);
     Ok(1)
 }
 
 fn execute_remove(context: &CommandContext, target_kind: TargetKind) -> CommandExecutorResult {
     let accessor = target_kind.access(context, "target")?;
     let path = context.get_argument::<NbtPath>("path")?;
-    let count = accessor.modify(&mut |root| match path.remove(root) {
+    let count = accessor.modify_at(path, &mut |root| match path.remove(root) {
         0 => Err(ERROR_MERGE_UNCHANGED.create_without_context()),
         count => Ok(count),
     })?;
     context
         .source
-        .send_feedback(accessor.get_modified_success(), true);
+        .send_feedback_with(|| accessor.get_modified_success(), true);
     Ok(count)
 }
 
@@ -765,7 +833,7 @@ fn execute_modify(
     let target_accessor = target_kind.access(context, "target")?;
     let target_path = context.get_argument::<NbtPath>("targetPath")?;
     // Read the source first: it may be the same storage as the target.
-    let source_tags = resolve_source_tags(context, source_kind, source_mode)?;
+    let mut source_tags = resolve_source_tags(context, source_kind, source_mode)?;
     if matches!(modify_mode, ModifyMode::Merge) {
         for tag in &source_tags {
             if is_too_deep(tag, 0) {
@@ -774,13 +842,17 @@ fn execute_modify(
         }
     }
 
-    let result = target_accessor.modify(&mut |root| {
+    let result = target_accessor.modify_at(target_path, &mut |root| {
         let result = match modify_mode {
             ModifyMode::Insert(idx) => target_path.insert(idx, root, &source_tags)?,
             ModifyMode::Prepend => target_path.insert(0, root, &source_tags)?,
             ModifyMode::Append => target_path.insert(-1, root, &source_tags)?,
             ModifyMode::Set => {
-                let last_tag = source_tags.last().cloned().unwrap_or(NbtTag::End);
+                // The accessor calls this once, so the last tag can move into the
+                // target instead of being copied. Datapacks set multi-kilobyte
+                // subtrees (`data modify storage ... set from entity ... car_data`)
+                // once per entity per tick.
+                let last_tag = source_tags.pop().unwrap_or(NbtTag::End);
                 target_path.set(root, last_tag)?
             }
             ModifyMode::Merge => {
@@ -807,7 +879,7 @@ fn execute_modify(
     })?;
     context
         .source
-        .send_feedback(target_accessor.get_modified_success(), true);
+        .send_feedback_with(|| target_accessor.get_modified_success(), true);
     Ok(result)
 }
 

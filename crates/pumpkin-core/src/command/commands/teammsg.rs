@@ -25,7 +25,7 @@ impl CommandExecutor for TeamMsgCommandExecutor {
         let sender_name = player.gameprofile.name.clone();
         let world = context.world().clone();
         let message_text = StringArgumentType::get(context, ARG_MESSAGE)?.to_string();
-        let sender_display_name = context.source.display_name.clone();
+        let sender_display_name = context.source.display_name();
 
         let scoreboard = world
             .scoreboard

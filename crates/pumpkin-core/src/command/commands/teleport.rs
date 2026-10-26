@@ -72,17 +72,19 @@ impl CommandExecutor for SelfToPosExecutor {
         let world = context.source.world();
         entity.teleport(pos, Some(yaw), Some(pitch), world.clone());
 
-        context.source.send_feedback(
-            TextComponent::translate_cross(
-                translation::java::COMMANDS_TELEPORT_SUCCESS_LOCATION_SINGLE,
-                translation::bedrock::COMMANDS_TP_SUCCESS_COORDINATES,
-                [
-                    entity.get_display_name(),
-                    TextComponent::text(pos.x.to_string()),
-                    TextComponent::text(pos.y.to_string()),
-                    TextComponent::text(pos.z.to_string()),
-                ],
-            ),
+        context.source.send_feedback_with(
+            || {
+                TextComponent::translate_cross(
+                    translation::java::COMMANDS_TELEPORT_SUCCESS_LOCATION_SINGLE,
+                    translation::bedrock::COMMANDS_TP_SUCCESS_COORDINATES,
+                    [
+                        entity.get_display_name(),
+                        TextComponent::text(pos.x.to_string()),
+                        TextComponent::text(pos.y.to_string()),
+                        TextComponent::text(pos.z.to_string()),
+                    ],
+                )
+            },
             true,
         );
 
@@ -109,15 +111,17 @@ impl CommandExecutor for SelfToEntityExecutor {
 
         entity.teleport(pos, Some(yaw), Some(pitch), world);
 
-        context.source.send_feedback(
-            TextComponent::translate_cross(
-                translation::java::COMMANDS_TELEPORT_SUCCESS_ENTITY_SINGLE,
-                translation::bedrock::COMMANDS_TP_SUCCESSVICTIM,
-                [
-                    entity.get_display_name(),
-                    destination_entity.get_display_name(),
-                ],
-            ),
+        context.source.send_feedback_with(
+            || {
+                TextComponent::translate_cross(
+                    translation::java::COMMANDS_TELEPORT_SUCCESS_ENTITY_SINGLE,
+                    translation::bedrock::COMMANDS_TP_SUCCESSVICTIM,
+                    [
+                        entity.get_display_name(),
+                        destination_entity.get_display_name(),
+                    ],
+                )
+            },
             true,
         );
 
@@ -150,12 +154,14 @@ impl CommandExecutor for EntitiesToEntityExecutor {
             translation::java::COMMANDS_TELEPORT_SUCCESS_ENTITY_SINGLE,
             translation::java::COMMANDS_TELEPORT_SUCCESS_ENTITY_MULTIPLE,
         );
-        context.source.send_feedback(
-            TextComponent::translate_cross(
-                key,
-                translation::bedrock::COMMANDS_TP_SUCCESSVICTIM,
-                [target_arg, destination_entity.get_display_name()],
-            ),
+        context.source.send_feedback_with(
+            || {
+                TextComponent::translate_cross(
+                    key,
+                    translation::bedrock::COMMANDS_TP_SUCCESSVICTIM,
+                    [target_arg, destination_entity.get_display_name()],
+                )
+            },
             true,
         );
 
@@ -186,17 +192,19 @@ impl CommandExecutor for EntitiesToPosExecutor {
             translation::java::COMMANDS_TELEPORT_SUCCESS_LOCATION_SINGLE,
             translation::java::COMMANDS_TELEPORT_SUCCESS_LOCATION_MULTIPLE,
         );
-        context.source.send_feedback(
-            TextComponent::translate_cross(
-                key,
-                translation::bedrock::COMMANDS_TP_SUCCESS_COORDINATES,
-                [
-                    target_arg,
-                    TextComponent::text(pos.x.to_string()),
-                    TextComponent::text(pos.y.to_string()),
-                    TextComponent::text(pos.z.to_string()),
-                ],
-            ),
+        context.source.send_feedback_with(
+            || {
+                TextComponent::translate_cross(
+                    key,
+                    translation::bedrock::COMMANDS_TP_SUCCESS_COORDINATES,
+                    [
+                        target_arg,
+                        TextComponent::text(pos.x.to_string()),
+                        TextComponent::text(pos.y.to_string()),
+                        TextComponent::text(pos.z.to_string()),
+                    ],
+                )
+            },
             true,
         );
 
@@ -229,17 +237,19 @@ impl CommandExecutor for EntitiesToPosWithRotationExecutor {
             translation::java::COMMANDS_TELEPORT_SUCCESS_LOCATION_SINGLE,
             translation::java::COMMANDS_TELEPORT_SUCCESS_LOCATION_MULTIPLE,
         );
-        context.source.send_feedback(
-            TextComponent::translate_cross(
-                key,
-                translation::bedrock::COMMANDS_TP_SUCCESS_COORDINATES,
-                [
-                    target_arg,
-                    TextComponent::text(pos.x.to_string()),
-                    TextComponent::text(pos.y.to_string()),
-                    TextComponent::text(pos.z.to_string()),
-                ],
-            ),
+        context.source.send_feedback_with(
+            || {
+                TextComponent::translate_cross(
+                    key,
+                    translation::bedrock::COMMANDS_TP_SUCCESS_COORDINATES,
+                    [
+                        target_arg,
+                        TextComponent::text(pos.x.to_string()),
+                        TextComponent::text(pos.y.to_string()),
+                        TextComponent::text(pos.z.to_string()),
+                    ],
+                )
+            },
             true,
         );
 
@@ -277,17 +287,19 @@ impl CommandExecutor for EntitiesToPosFacingPosExecutor {
             translation::java::COMMANDS_TELEPORT_SUCCESS_LOCATION_SINGLE,
             translation::java::COMMANDS_TELEPORT_SUCCESS_LOCATION_MULTIPLE,
         );
-        context.source.send_feedback(
-            TextComponent::translate_cross(
-                key,
-                translation::bedrock::COMMANDS_TP_SUCCESS_COORDINATES,
-                [
-                    target_arg,
-                    TextComponent::text(pos.x.to_string()),
-                    TextComponent::text(pos.y.to_string()),
-                    TextComponent::text(pos.z.to_string()),
-                ],
-            ),
+        context.source.send_feedback_with(
+            || {
+                TextComponent::translate_cross(
+                    key,
+                    translation::bedrock::COMMANDS_TP_SUCCESS_COORDINATES,
+                    [
+                        target_arg,
+                        TextComponent::text(pos.x.to_string()),
+                        TextComponent::text(pos.y.to_string()),
+                        TextComponent::text(pos.z.to_string()),
+                    ],
+                )
+            },
             true,
         );
 
@@ -333,17 +345,19 @@ impl CommandExecutor for EntitiesToPosFacingEntityExecutor {
             translation::java::COMMANDS_TELEPORT_SUCCESS_LOCATION_SINGLE,
             translation::java::COMMANDS_TELEPORT_SUCCESS_LOCATION_MULTIPLE,
         );
-        context.source.send_feedback(
-            TextComponent::translate_cross(
-                key,
-                translation::bedrock::COMMANDS_TP_SUCCESS_COORDINATES,
-                [
-                    target_arg,
-                    TextComponent::text(pos.x.to_string()),
-                    TextComponent::text(pos.y.to_string()),
-                    TextComponent::text(pos.z.to_string()),
-                ],
-            ),
+        context.source.send_feedback_with(
+            || {
+                TextComponent::translate_cross(
+                    key,
+                    translation::bedrock::COMMANDS_TP_SUCCESS_COORDINATES,
+                    [
+                        target_arg,
+                        TextComponent::text(pos.x.to_string()),
+                        TextComponent::text(pos.y.to_string()),
+                        TextComponent::text(pos.z.to_string()),
+                    ],
+                )
+            },
             true,
         );
 

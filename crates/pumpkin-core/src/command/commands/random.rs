@@ -88,7 +88,7 @@ impl CommandExecutor for RandomExecutor {
                 translation::java::COMMANDS_RANDOM_ROLL,
                 translation::java::COMMANDS_RANDOM_ROLL,
                 [
-                    context.source.display_name.clone(),
+                    context.source.display_name(),
                     TextComponent::text(value.to_string()),
                     TextComponent::text(min.to_string()),
                     TextComponent::text(max.to_string()),
