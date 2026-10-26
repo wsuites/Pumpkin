@@ -44,6 +44,11 @@ const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static MAIN_THREAD: OnceLock<ThreadId> = OnceLock::new();
 
+// Datapack functions allocate and free many small values per command line. The
+// system allocator (especially the Windows heap) makes that a large part of a tick.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // WARNING: All rayon calls from the tokio runtime must be non-blocking! This includes things
 // like `par_iter`. These should be spawned in the the rayon pool and then passed to the tokio
 // runtime with a channel! See `Level::fetch_chunks` as an example!
