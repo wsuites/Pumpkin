@@ -77,7 +77,7 @@ pub struct DatapackManager {
     loaded_packs: RwLock<Vec<LoadedDatapack>>,
     functions: RwLock<HashMap<String, Arc<[String]>>>,
     function_tags: RwLock<HashMap<String, Vec<String>>>,
-    block_tags: RwLock<HashMap<String, Vec<String>>>,
+    block_tags: RwLock<HashMap<String, function_loader::BlockTagEntry>>,
     /// Flattened block tags, filled on first use and cleared when packs reload.
     resolved_block_tags: RwLock<HashMap<String, Arc<[u16]>>>,
     test_instances: RwLock<TestInstanceRegistry>,
@@ -137,7 +137,7 @@ impl DatapackManager {
         let mut all_recipes: Vec<DynamicRecipe> = Vec::new();
         let mut all_functions: HashMap<String, Vec<String>> = HashMap::new();
         let mut all_function_tags: HashMap<String, Vec<String>> = HashMap::new();
-        let mut all_block_tags: HashMap<String, Vec<String>> = HashMap::new();
+        let mut all_block_tags: HashMap<String, function_loader::BlockTagEntry> = HashMap::new();
         let mut all_test_instances: TestInstanceRegistry = HashMap::new();
         let mut all_context_int_providers: ContextProviderRegistry = HashMap::new();
         let mut all_context_float_providers: ContextProviderRegistry = HashMap::new();
@@ -771,6 +771,26 @@ impl DatapackManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(tag.to_string(), ids.clone());
         ids
+    }
+    /// Every datapack block tag resolved to block ids, for syncing tags to clients.
+    #[must_use]
+    pub fn block_tags_for_clients(&self) -> Vec<(String, Vec<u16>)> {
+        let tags = self
+            .block_tags
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut resolved: Vec<_> = tags
+            .keys()
+            .map(|name| {
+                let mut ids = Vec::new();
+                collect_block_tag(&tags, name, &mut ids, &mut Vec::new());
+                ids.sort_unstable();
+                ids.dedup();
+                (name.clone(), ids)
+            })
+            .collect();
+        resolved.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        resolved
     }
 
     pub fn get_function_names(&self) -> Vec<String> {
@@ -1497,7 +1517,7 @@ fn normalize_id(id: &str) -> String {
 }
 
 fn collect_block_tag(
-    tags: &HashMap<String, Vec<String>>,
+    tags: &HashMap<String, function_loader::BlockTagEntry>,
     tag: &str,
     ids: &mut Vec<u16>,
     visited: &mut Vec<String>,
@@ -1506,24 +1526,28 @@ fn collect_block_tag(
     if visited.contains(&tag) {
         return;
     }
-    if let Some(builtin) =
-        pumpkin_data::tag::get_tag_ids(pumpkin_data::tag::RegistryKey::Block, &tag).or_else(|| {
-            pumpkin_data::tag::get_tag_ids(
-                pumpkin_data::tag::RegistryKey::Block,
-                tag.strip_prefix("minecraft:").unwrap_or(&tag),
+    visited.push(tag.clone());
+    let entry = tags.get(&tag);
+    if !entry.is_some_and(|e| e.replace)
+        && let Some(builtin) =
+            pumpkin_data::tag::get_tag_ids(pumpkin_data::tag::RegistryKey::Block, &tag).or_else(
+                || {
+                    pumpkin_data::tag::get_tag_ids(
+                        pumpkin_data::tag::RegistryKey::Block,
+                        tag.strip_prefix("minecraft:").unwrap_or(&tag),
+                    )
+                },
             )
-        })
     {
         ids.extend_from_slice(builtin);
     }
-    visited.push(tag.clone());
-    let Some(entries) = tags.get(&tag) else {
+    let Some(entry) = entry else {
         return;
     };
-    for entry in entries {
-        if let Some(nested) = entry.strip_prefix('#') {
+    for value in &entry.values {
+        if let Some(nested) = value.strip_prefix('#') {
             collect_block_tag(tags, nested, ids, visited);
-        } else if let Some(block) = pumpkin_data::Block::from_name(&normalize_id(entry)) {
+        } else if let Some(block) = pumpkin_data::Block::from_name(&normalize_id(value)) {
             ids.push(block.id.as_u16());
         }
     }
@@ -1533,7 +1557,7 @@ struct PackContentAccumulators<'a> {
     recipes: &'a mut Vec<DynamicRecipe>,
     functions: &'a mut HashMap<String, Vec<String>>,
     function_tags: &'a mut HashMap<String, Vec<String>>,
-    block_tags: &'a mut HashMap<String, Vec<String>>,
+    block_tags: &'a mut HashMap<String, function_loader::BlockTagEntry>,
     test_instances: &'a mut TestInstanceRegistry,
     damage_types: &'a mut HashMap<String, DamageTypeDefinition>,
     context_int_providers: &'a mut ContextProviderRegistry,
@@ -1982,7 +2006,8 @@ fn load_recipes_from_dir(
 }
 #[cfg(test)]
 mod tests {
-    use super::DatapackManager;
+    use super::{DatapackManager, function_loader};
+    use std::collections::HashMap;
 
     #[test]
     fn function_dispatch_releases_the_functions_lock() {
@@ -2134,5 +2159,48 @@ mod tests {
                 "minecraft:bundle"
             ]
         );
+    }
+
+    fn block_tag(replace: bool, values: &[&str]) -> function_loader::BlockTagEntry {
+        function_loader::BlockTagEntry {
+            replace,
+            values: values.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    fn resolve(tags: &HashMap<String, function_loader::BlockTagEntry>, tag: &str) -> Vec<u16> {
+        let mut ids = Vec::new();
+        super::collect_block_tag(tags, tag, &mut ids, &mut Vec::new());
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    #[test]
+    fn block_tags_resolve_nested_replace_and_builtin() {
+        let stone = pumpkin_data::Block::STONE.id.as_u16();
+        let granite = pumpkin_data::Block::GRANITE.id.as_u16();
+        let mut tags = HashMap::new();
+        tags.insert(
+            "test:stones".to_string(),
+            block_tag(false, &["minecraft:stone"]),
+        );
+        tags.insert(
+            "test:rocks".to_string(),
+            block_tag(false, &["#test:stones", "granite", "#test:rocks"]),
+        );
+        assert_eq!(resolve(&tags, "test:rocks"), {
+            let mut v = vec![stone, granite];
+            v.sort_unstable();
+            v
+        });
+
+        let builtin = resolve(&tags, "minecraft:dirt");
+        assert!(builtin.len() > 1);
+        tags.insert("minecraft:dirt".to_string(), block_tag(false, &["stone"]));
+        assert!(resolve(&tags, "minecraft:dirt").contains(&stone));
+        assert_eq!(resolve(&tags, "minecraft:dirt").len(), builtin.len() + 1);
+        tags.insert("minecraft:dirt".to_string(), block_tag(true, &["stone"]));
+        assert_eq!(resolve(&tags, "minecraft:dirt"), vec![stone]);
     }
 }
