@@ -187,4 +187,19 @@ mod test {
         assert!(parse("salmon_spawn_egg[salmon/size=\"large\",").is_err());
         assert!(parse("salmon_spawn_egg[%]").is_err());
     }
+
+    #[test]
+    fn styled_name_and_lore_parse() {
+        let stack = parse(
+            "paper[lore=[{text:\"red line\",color:\"red\"}],custom_name={text:\"Named\",italic:false}]",
+        )
+        .unwrap();
+        assert_eq!(stack.patch.len(), 2);
+        assert!(stack.patch.iter().all(|(_, value)| value.is_some()));
+        let name = stack
+            .get_data_component::<pumpkin_data::data_component_impl::CustomNameImpl>()
+            .unwrap();
+        assert_eq!(name.name.clone().get_text(), "Named");
+        assert_eq!(name.name.0.style.italic, Some(false));
+    }
 }
