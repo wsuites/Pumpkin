@@ -35,7 +35,7 @@ pub struct Style {
     #[serde(default, alias = "clickEvent", skip_serializing_if = "Option::is_none")]
     pub click_event: Option<ClickEvent>,
     /// Allows for a tooltip to be displayed when the player hovers their mouse over text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "hoverEvent", skip_serializing_if = "Option::is_none")]
     pub hover_event: Option<HoverEvent>,
     /// Allows you to change the font of the text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
