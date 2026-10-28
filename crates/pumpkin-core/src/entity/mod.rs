@@ -3542,6 +3542,46 @@ impl Entity {
         // intermediate positions, e.g. a datapack that teleports away and back in the same
         // tick, which makes the client snap instead of interpolating.
         self.position_riders();
+        // Vanilla `sendTeleportTransitionToPlayers`: players riding the entity always get the
+        // teleport, because the client drives its own vehicle and would otherwise move it
+        // back with its next `MoveVehicle` packet.
+        self.send_teleport_to_riders();
+    }
+
+    fn send_teleport_to_riders(&self) {
+        let mut riders = Vec::new();
+        self.collect_player_riders(&mut riders);
+        if riders.is_empty() {
+            return;
+        }
+        let packet = pumpkin_protocol::java::client::play::CTeleportEntity::new(
+            self.entity_id.into(),
+            self.pos.load(),
+            Vector3::new(0.0, 0.0, 0.0),
+            self.yaw.load(),
+            self.pitch.load(),
+            &[],
+            self.on_ground.load(Ordering::SeqCst),
+        );
+        for rider in riders {
+            if let Some(player) = rider.get_player() {
+                player.try_send_client_packet(&packet);
+            }
+        }
+    }
+
+    fn collect_player_riders(&self, out: &mut Vec<Arc<dyn EntityBase>>) {
+        let passengers = self
+            .passengers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for passenger in passengers {
+            passenger.get_entity().collect_player_riders(out);
+            if passenger.get_player().is_some() {
+                out.push(passenger);
+            }
+        }
     }
 
     pub fn get_eye_pos(&self) -> Vector3<f64> {
